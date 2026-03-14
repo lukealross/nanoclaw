@@ -18,6 +18,14 @@ groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 
+!groups/whatsapp_main/
+groups/whatsapp_main/*
+!groups/whatsapp_main/CLAUDE.md
+
+!groups/whatsapp_stella/
+groups/whatsapp_stella/*
+!groups/whatsapp_stella/CLAUDE.md
+
 # Secrets
 *.keys.json
 .env
