@@ -1,0 +1,218 @@
+#!/usr/bin/env node
+
+const COMPASS = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+
+function compassDir(deg) {
+  return COMPASS[Math.round(deg / 22.5) % 16];
+}
+
+function angleDiff(a, b) {
+  const d = Math.abs(((a - b) % 360 + 360) % 360);
+  return d > 180 ? 360 - d : d;
+}
+
+function rateConditions(swellH, swellP, windSpeed, windDir, swellDir) {
+  // Swell score based on energy (H² × T)
+  const energy = swellH * swellH * swellP;
+  let score;
+  if (energy < 0.5) score = 1;
+  else if (energy < 2.0) score = 2;
+  else if (energy < 5.0) score = 3;
+  else if (energy < 12.0) score = 4;
+  else score = 5;
+
+  // Wind penalty based on direction relative to swell and speed
+  const diff = angleDiff(windDir, swellDir);
+  let penalty = 0;
+  if (diff >= 150) {
+    // Offshore
+    if (windSpeed >= 15) penalty = 0.5;
+  } else if (diff >= 60) {
+    // Cross-shore
+    if (windSpeed < 15) penalty = 0.5;
+    else if (windSpeed < 25) penalty = 1.0;
+    else penalty = 1.5;
+  } else {
+    // Onshore
+    if (windSpeed < 10) penalty = 1.0;
+    else if (windSpeed < 20) penalty = 2.0;
+    else penalty = 3.0;
+  }
+
+  return Math.max(1, Math.min(5, Math.round(score - penalty)));
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  let location = '';
+  let timezone = '';
+  let date = '';
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--timezone' && args[i + 1]) {
+      timezone = args[++i];
+    } else if (args[i] === '--date' && args[i + 1]) {
+      date = args[++i];
+    } else {
+      location = location ? `${location} ${args[i]}` : args[i];
+    }
+  }
+
+  if (!location) {
+    console.error('Usage: surf-forecast <location> [--timezone <tz>] [--date YYYY-MM-DD]');
+    console.error('Example: surf-forecast "Muizenberg, Cape Town" --date 2026-03-20');
+    process.exit(1);
+  }
+
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error('Error: --date must be in YYYY-MM-DD format');
+    process.exit(1);
+  }
+
+  if (date) {
+    const target = new Date(date + 'T00:00:00');
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const daysAhead = Math.round((target - today) / 86400000);
+    if (daysAhead < 0) {
+      console.error('Error: --date must be today or in the future');
+      process.exit(1);
+    }
+    if (daysAhead > 7) {
+      console.error(`Error: Marine forecast only available up to 8 days ahead (requested ${daysAhead} days)`);
+      process.exit(1);
+    }
+  }
+
+  return { location, timezone, date };
+}
+
+async function geocode(location) {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Geocoding failed: ${res.status}`);
+  const data = await res.json();
+  if (!data.results?.length) throw new Error(`Location not found: ${location}`);
+  const r = data.results[0];
+  return { name: r.name, country: r.country, lat: r.latitude, lon: r.longitude, timezone: r.timezone };
+}
+
+async function fetchMarine(lat, lon, timezone, date) {
+  const params = new URLSearchParams({
+    latitude: lat, longitude: lon, timezone,
+    hourly: 'wave_height,swell_wave_height,swell_wave_period,swell_wave_direction,sea_surface_temperature',
+  });
+  if (date) { params.set('start_date', date); params.set('end_date', date); }
+  else { params.set('forecast_days', '8'); }
+  const res = await fetch(`https://marine-api.open-meteo.com/v1/marine?${params}`);
+  if (!res.ok) throw new Error(`Marine API failed: ${res.status}`);
+  return res.json();
+}
+
+async function fetchWind(lat, lon, timezone, date) {
+  const params = new URLSearchParams({
+    latitude: lat, longitude: lon, timezone,
+    hourly: 'wind_speed_10m,wind_direction_10m',
+  });
+  if (date) { params.set('start_date', date); params.set('end_date', date); }
+  else { params.set('forecast_days', '8'); }
+  const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`);
+  if (!res.ok) throw new Error(`Weather API failed: ${res.status}`);
+  return res.json();
+}
+
+function formatDate(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+}
+
+function buildReport(geo, marine, wind, singleDate) {
+  const m = marine.hourly;
+  const w = wind.hourly;
+  const lines = [];
+
+  // Average sea surface temperature across the full range
+  const temps = m.sea_surface_temperature.filter(t => t != null);
+  const avgSeaTemp = temps.length ? Math.round(temps.reduce((a, b) => a + b, 0) / temps.length) : null;
+
+  lines.push(`Surf: ${geo.name}, ${geo.country}${avgSeaTemp != null ? ` | Sea: ${avgSeaTemp}°C` : ''}`);
+
+  // Show current conditions only in multi-day mode
+  if (!singleDate) {
+    const now = new Date();
+    const nowHour = m.time.findIndex(t => new Date(t) >= now);
+    if (nowHour >= 0) {
+      const time = m.time[nowHour].slice(11, 16);
+      const waveH = m.wave_height[nowHour] ?? 0;
+      const swellH = m.swell_wave_height[nowHour] ?? 0;
+      const swellP = m.swell_wave_period[nowHour] ?? 0;
+      const swellD = m.swell_wave_direction[nowHour] ?? 0;
+      const windS = w.wind_speed_10m[nowHour] ?? 0;
+      const windD = w.wind_direction_10m[nowHour] ?? 0;
+
+      const rating = rateConditions(swellH, swellP, windS, windD, swellD);
+
+      lines.push('');
+      lines.push(`Current (${time})`);
+      lines.push(`Waves: ${waveH.toFixed(1)}m | Swell: ${swellH.toFixed(1)}m @ ${Math.round(swellP)}s from ${compassDir(swellD)}`);
+      lines.push(`Wind: ${Math.round(windS)} km/h ${compassDir(windD)} | Rating: ${rating}/5`);
+    }
+  }
+
+  // Group by date
+  // Single date: every hour 07:00-18:00; multi-day: even hours 06:00-20:00
+  const byDate = new Map();
+  for (let i = 0; i < m.time.length; i++) {
+    const hour = parseInt(m.time[i].slice(11, 13), 10);
+    if (singleDate) {
+      if (hour < 7 || hour > 18) continue;
+    } else {
+      if (hour < 6 || hour > 20 || hour % 2 !== 0) continue;
+    }
+    const dateKey = m.time[i].slice(0, 10);
+    if (!byDate.has(dateKey)) byDate.set(dateKey, []);
+    byDate.get(dateKey).push(i);
+  }
+
+  for (const [dateKey, indices] of byDate) {
+    lines.push('');
+    lines.push(`Hourly — ${formatDate(dateKey)}`);
+
+    for (const i of indices) {
+      const time = m.time[i].slice(11, 16);
+      const waveH = (m.wave_height[i] ?? 0).toFixed(1);
+      const swellH = m.swell_wave_height[i] ?? 0;
+      const swellP = m.swell_wave_period[i] ?? 0;
+      const swellDRaw = m.swell_wave_direction[i] ?? 0;
+      const swellDStr = compassDir(swellDRaw);
+      const windS = w.wind_speed_10m[i] ?? 0;
+      const windDRaw = w.wind_direction_10m[i] ?? 0;
+      const windDStr = compassDir(windDRaw);
+      const rating = rateConditions(swellH, swellP, windS, windDRaw, swellDRaw);
+
+      lines.push(`${time}  ${waveH}m  ${swellH.toFixed(1)}m @ ${Math.round(swellP)}s ${swellDStr}  ${Math.round(windS)} km/h ${windDStr}  ${rating}/5`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function main() {
+  const { location, timezone: tzOverride, date } = parseArgs(process.argv);
+
+  const geo = await geocode(location);
+  const tz = tzOverride || geo.timezone;
+
+  const [marine, wind] = await Promise.all([
+    fetchMarine(geo.lat, geo.lon, tz, date),
+    fetchWind(geo.lat, geo.lon, tz, date),
+  ]);
+
+  console.log(buildReport(geo, marine, wind, date));
+}
+
+main().catch(err => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

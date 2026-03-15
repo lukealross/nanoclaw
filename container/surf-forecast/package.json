@@ -1,9 +1,0 @@
-{
-  "name": "surf-forecast",
-  "version": "1.0.0",
-  "description": "Surf forecast CLI using Open-Meteo APIs",
-  "type": "module",
-  "bin": {
-    "surf-forecast": "index.js"
-  }
-}

@@ -28,22 +28,44 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   let location = '';
   let timezone = '';
+  let date = '';
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--timezone' && args[i + 1]) {
       timezone = args[++i];
+    } else if (args[i] === '--date' && args[i + 1]) {
+      date = args[++i];
     } else {
       location = location ? `${location} ${args[i]}` : args[i];
     }
   }
 
   if (!location) {
-    console.error('Usage: weather <location> [--timezone <tz>]');
-    console.error('Example: weather "Cape Town"');
+    console.error('Usage: weather <location> [--timezone <tz>] [--date YYYY-MM-DD]');
+    console.error('Example: weather "Cape Town" --date 2026-03-20');
     process.exit(1);
   }
 
-  return { location, timezone };
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error('Error: --date must be in YYYY-MM-DD format');
+    process.exit(1);
+  }
+
+  if (date) {
+    const target = new Date(date + 'T00:00:00');
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const daysAhead = Math.round((target - today) / 86400000);
+    if (daysAhead < 0) {
+      console.error('Error: --date must be today or in the future');
+      process.exit(1);
+    }
+    if (daysAhead > 15) {
+      console.error(`Error: Weather forecast only available up to 16 days ahead (requested ${daysAhead} days)`);
+      process.exit(1);
+    }
+  }
+
+  return { location, timezone, date };
 }
 
 async function geocode(location) {
@@ -56,15 +78,17 @@ async function geocode(location) {
   return { name: r.name, country: r.country, lat: r.latitude, lon: r.longitude, timezone: r.timezone };
 }
 
-async function fetchForecast(lat, lon, timezone) {
-  const params = new URLSearchParams({
-    latitude: lat,
-    longitude: lon,
-    current: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m',
-    daily: 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_sum,precipitation_probability_max,wind_speed_10m_max',
-    forecast_days: '3',
-    timezone,
-  });
+async function fetchForecast(lat, lon, timezone, date) {
+  const params = new URLSearchParams({ latitude: lat, longitude: lon, timezone });
+  if (date) {
+    params.set('hourly', 'temperature_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,relative_humidity_2m');
+    params.set('start_date', date);
+    params.set('end_date', date);
+  } else {
+    params.set('current', 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m');
+    params.set('daily', 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_sum,precipitation_probability_max,wind_speed_10m_max');
+    params.set('forecast_days', '3');
+  }
   const url = `https://api.open-meteo.com/v1/forecast?${params}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Forecast failed: ${res.status}`);
@@ -82,12 +106,32 @@ function formatDate(isoString) {
   return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
 }
 
-function buildReport(geo, data) {
+function buildReport(geo, data, singleDate) {
+  const lines = [];
+  lines.push(`Weather: ${geo.name}, ${geo.country}`);
+
+  if (singleDate) {
+    const h = data.hourly;
+    lines.push('');
+    lines.push(`Hourly — ${formatDate(singleDate)}`);
+    for (let i = 0; i < h.time.length; i++) {
+      const hour = parseInt(h.time[i].slice(11, 13), 10);
+      if (hour < 7 || hour > 21) continue;
+      const time = formatTime(h.time[i]);
+      const temp = Math.round(h.temperature_2m[i]);
+      const feels = Math.round(h.apparent_temperature[i]);
+      const desc = weatherDescription(h.weather_code[i]);
+      const wind = Math.round(h.wind_speed_10m[i]);
+      const windDir = compassDir(h.wind_direction_10m[i]);
+      const rain = h.precipitation[i];
+      const humidity = h.relative_humidity_2m[i];
+      lines.push(`${time}  ${temp}°C (${feels}°C)  ${desc}  ${wind} km/h ${windDir}  ${rain}mm  ${humidity}%`);
+    }
+    return lines.join('\n');
+  }
+
   const c = data.current;
   const d = data.daily;
-  const lines = [];
-
-  lines.push(`Weather: ${geo.name}, ${geo.country}`);
   lines.push('');
 
   // Current conditions
@@ -113,13 +157,13 @@ function buildReport(geo, data) {
 }
 
 async function main() {
-  const { location, timezone: tzOverride } = parseArgs(process.argv);
+  const { location, timezone: tzOverride, date } = parseArgs(process.argv);
 
   const geo = await geocode(location);
   const tz = tzOverride || geo.timezone;
-  const data = await fetchForecast(geo.lat, geo.lon, tz);
+  const data = await fetchForecast(geo.lat, geo.lon, tz, date);
 
-  console.log(buildReport(geo, data));
+  console.log(buildReport(geo, data, date));
 }
 
 main().catch(err => {

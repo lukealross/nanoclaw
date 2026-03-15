@@ -33,9 +33,9 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
-# Install surf-forecast CLI globally
-COPY surf-forecast/ /opt/surf-forecast/
-RUN npm install -g /opt/surf-forecast/
+# Install surf-forecast CLI
+COPY skills/surf-forecast/surf-forecast /usr/local/bin/surf-forecast
+RUN chmod +x /usr/local/bin/surf-forecast
 
 # Create app directory
 WORKDIR /app

@@ -11,22 +11,25 @@ allowed-tools: Bash(weather:*)
 ```bash
 weather "Cape Town"
 weather "Tokyo, Japan" --timezone Asia/Tokyo
+weather "London" --date 2026-03-20
 ```
 
 ## Usage
 
 ```
-weather <location> [--timezone <tz>]
+weather <location> [--timezone <tz>] [--date YYYY-MM-DD]
 ```
 
 - `location` — any city, town, or place name
 - `--timezone` — IANA timezone (default: auto-detected from location)
+- `--date` — specific date in YYYY-MM-DD format (up to 16 days ahead; returns hourly 07:00–21:00)
 
 ## Output
 
-Returns a concise weather report with:
-- Current conditions (temperature, feels-like, humidity, wind, precipitation)
-- 3-day forecast (high/low temps, weather, wind, rain probability, sunrise/sunset)
+Without `--date`: current conditions + 3-day daily forecast.
+With `--date`: hourly breakdown (every hour, 07:00–21:00) for that single day.
+
+Data includes temperature, feels-like, weather description, wind, precipitation, and humidity.
 
 ## Tips
 

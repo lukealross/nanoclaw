@@ -1,6 +1,6 @@
 ---
 name: surf-forecast
-description: Get surf and wave forecasts for any coastal location — wave height, swell period/direction, wind conditions, and best-time recommendations. Use when user asks about surf, waves, ocean conditions, or beach weather.
+description: Get surf and wave forecasts for any coastal location — wave height, swell period/direction, and wind conditions. Use when user asks about surf, waves, ocean conditions, or beach weather.
 allowed-tools: Bash(surf-forecast:*)
 ---
 
@@ -11,53 +11,34 @@ allowed-tools: Bash(surf-forecast:*)
 ```bash
 surf-forecast "Muizenberg, Cape Town"
 surf-forecast "Pipeline, Hawaii" --timezone Pacific/Honolulu
+surf-forecast "Big Bay, Cape Town" --date 2026-03-20
 ```
 
 ## Usage
 
 ```
-surf-forecast <location> [--timezone <tz>]
+surf-forecast <location> [--timezone <tz>] [--date YYYY-MM-DD]
 ```
 
-- `location` — any coastal town, beach, or surf spot name; include City if possible
+- `location` — any coastal town, beach, or surf spot name; include city if possible
 - `--timezone` — IANA timezone (default: auto-detected from location)
+- `--date` — specific date in YYYY-MM-DD format (up to 8 days ahead; returns every hour 07:00–18:00)
 
 ## Output
 
-Returns a WhatsApp-formatted surf report for the requested time period with:
-- Primary surf conditions (wave height and wind) using meters (m) and kilometers per hour (kph)
-- What times (in the day) are the low and high tides
-- Best surfing window (limit to reasonable times; earliest 7am in summer, 8am in winter)
+Without `--date`: current conditions + breakdown (every 2 hours, 06:00–18:00) for 8 days.
+With `--date`: full hourly breakdown (every 2 hours, 06:00–18:00) for that single day.
+
+Each interval includes a 1–5 condition rating (1=poor, 5=excellent) based on swell energy and wind conditions. Data also includes wave height, swell height/period/direction, wind speed/direction, and temperature.
 
 ## Tips
 
-- Send the output directly to the user
 - The tool handles geocoding, so any recognizable place name works
 - For spots not near the coast, the marine API may return limited data
-- Scores factor in swell period, wave height, wind speed, and offshore/onshore wind direction
 
 ## Rules
 
 - Don't mention the data provider, unless asked
-
-## Formatting Example
-
-Surf Forecast: Melkbosstrand — Sunday 15 Mar
-
-Conditions
-Waves: 1.1–1.5m | Swell: WSW/SW
-Wind: Starts E offshore (5 km/h), turning onshore SW by afternoon (9–11 km/h)
-Tides: Low 07:00 · High 13:00 · Low 19:00
-
-Best Window
-Early morning — light offshore E wind with 1.4–1.5m sets. Conditions soften as the day progresses and wind shifts onshore by midday.
-
-Hourly snapshot
-07:00  1.4m  9s SW  5 km/h E (offshore) <<<
-09:00  1.3m  9s SW  4 km/h SE <<<
-11:00  1.2m  9s WSW  5 km/h SSW <<<
-13:00  1.2m  9s SW  8 km/h WSW <<
-15:00  1.1m  8s SW  9 km/h WSW <<
-17:00  1.1m  8s SW  8 km/h SSW <<
-
-Worth being out early. Once that offshore turns around midday it's just punchy onshore slop.
+- If the user asks about a specific day (e.g. "how's the surf on Tuesday?"), use --date to get the full hourly breakdown for that day
+- Present condition ratings exactly as given (N/5) — do not convert to any other scale
+- Include the sea temperature if you have it. Just a single value or an average will suffice.
