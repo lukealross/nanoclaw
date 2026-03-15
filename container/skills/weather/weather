@@ -1,0 +1,128 @@
+#!/usr/bin/env node
+
+const WMO_CODES = {
+  0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
+  45: 'Foggy', 48: 'Depositing rime fog',
+  51: 'Light drizzle', 53: 'Moderate drizzle', 55: 'Dense drizzle',
+  56: 'Light freezing drizzle', 57: 'Dense freezing drizzle',
+  61: 'Slight rain', 63: 'Moderate rain', 65: 'Heavy rain',
+  66: 'Light freezing rain', 67: 'Heavy freezing rain',
+  71: 'Slight snowfall', 73: 'Moderate snowfall', 75: 'Heavy snowfall',
+  77: 'Snow grains',
+  80: 'Slight rain showers', 81: 'Moderate rain showers', 82: 'Violent rain showers',
+  85: 'Slight snow showers', 86: 'Heavy snow showers',
+  95: 'Thunderstorm', 96: 'Thunderstorm with slight hail', 99: 'Thunderstorm with heavy hail',
+};
+
+const COMPASS = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+
+function compassDir(deg) {
+  return COMPASS[Math.round(deg / 22.5) % 16];
+}
+
+function weatherDescription(code) {
+  return WMO_CODES[code] ?? `Unknown (${code})`;
+}
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  let location = '';
+  let timezone = '';
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--timezone' && args[i + 1]) {
+      timezone = args[++i];
+    } else {
+      location = location ? `${location} ${args[i]}` : args[i];
+    }
+  }
+
+  if (!location) {
+    console.error('Usage: weather <location> [--timezone <tz>]');
+    console.error('Example: weather "Cape Town"');
+    process.exit(1);
+  }
+
+  return { location, timezone };
+}
+
+async function geocode(location) {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Geocoding failed: ${res.status}`);
+  const data = await res.json();
+  if (!data.results?.length) throw new Error(`Location not found: ${location}`);
+  const r = data.results[0];
+  return { name: r.name, country: r.country, lat: r.latitude, lon: r.longitude, timezone: r.timezone };
+}
+
+async function fetchForecast(lat, lon, timezone) {
+  const params = new URLSearchParams({
+    latitude: lat,
+    longitude: lon,
+    current: 'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m',
+    daily: 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_sum,precipitation_probability_max,wind_speed_10m_max',
+    forecast_days: '3',
+    timezone,
+  });
+  const url = `https://api.open-meteo.com/v1/forecast?${params}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Forecast failed: ${res.status}`);
+  return res.json();
+}
+
+function formatTime(isoString) {
+  return isoString.slice(11, 16);
+}
+
+function formatDate(isoString) {
+  const d = new Date(isoString + 'T00:00:00');
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+}
+
+function buildReport(geo, data) {
+  const c = data.current;
+  const d = data.daily;
+  const lines = [];
+
+  lines.push(`Weather: ${geo.name}, ${geo.country}`);
+  lines.push('');
+
+  // Current conditions
+  const now = formatTime(data.current.time);
+  lines.push(`Now (${now}) — ${weatherDescription(c.weather_code)}`);
+  lines.push(`Temp: ${Math.round(c.temperature_2m)}°C (feels ${Math.round(c.apparent_temperature)}°C) | Humidity: ${c.relative_humidity_2m}%`);
+  lines.push(`Wind: ${Math.round(c.wind_speed_10m)} km/h ${compassDir(c.wind_direction_10m)}, gusts ${Math.round(c.wind_gusts_10m)} km/h`);
+  lines.push(`Precipitation: ${c.precipitation}mm`);
+
+  // Daily forecasts
+  for (let i = 0; i < d.time.length; i++) {
+    lines.push('');
+    const label = i === 0 ? `Today — ${formatDate(d.time[i])}` : i === 1 ? `Tomorrow — ${formatDate(d.time[i])}` : formatDate(d.time[i]);
+    lines.push(label);
+    lines.push(`High: ${Math.round(d.temperature_2m_max[i])}°C  Low: ${Math.round(d.temperature_2m_min[i])}°C | ${weatherDescription(d.weather_code[i])}`);
+    lines.push(`Wind: up to ${Math.round(d.wind_speed_10m_max[i])} km/h | Rain: ${d.precipitation_probability_max[i]}% (${d.precipitation_sum[i]}mm)`);
+    if (d.sunrise[i] && d.sunset[i]) {
+      lines.push(`Sunrise: ${formatTime(d.sunrise[i])} | Sunset: ${formatTime(d.sunset[i])}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function main() {
+  const { location, timezone: tzOverride } = parseArgs(process.argv);
+
+  const geo = await geocode(location);
+  const tz = tzOverride || geo.timezone;
+  const data = await fetchForecast(geo.lat, geo.lon, tz);
+
+  console.log(buildReport(geo, data));
+}
+
+main().catch(err => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

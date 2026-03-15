@@ -52,6 +52,10 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
+# Install weather CLI
+COPY skills/weather/weather /usr/local/bin/weather
+RUN chmod +x /usr/local/bin/weather
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
