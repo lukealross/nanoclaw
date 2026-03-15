@@ -161,15 +161,11 @@ function buildReport(geo, marine, wind, singleDate) {
   }
 
   // Group by date
-  // Single date: every hour 07:00-18:00; multi-day: even hours 06:00-20:00
+  // Both modes: even hours 06:00-18:00 (daylight only)
   const byDate = new Map();
   for (let i = 0; i < m.time.length; i++) {
     const hour = parseInt(m.time[i].slice(11, 13), 10);
-    if (singleDate) {
-      if (hour < 7 || hour > 18) continue;
-    } else {
-      if (hour < 6 || hour > 20 || hour % 2 !== 0) continue;
-    }
+    if (hour < 6 || hour > 18 || hour % 2 !== 0) continue;
     const dateKey = m.time[i].slice(0, 10);
     if (!byDate.has(dateKey)) byDate.set(dateKey, []);
     byDate.get(dateKey).push(i);
