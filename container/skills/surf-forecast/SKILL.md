@@ -58,38 +58,37 @@ Use these WhatsApp-friendly templates for all surf forecast responses.
 ### Single day format (when using `--date`)
 
 ```
-🏄 *{Location}* — {Day Date}
-🌊 Sea: {temp}°C
+🏄 {Location} — {Day Date}
 
-{emoji} {time} — {wave}m | {swell}m @ {period}s {swell_dir} | 💨 {wind} km/h {wind_dir}
+{2-3 sentences: overall vibe, best window, wind pattern, who it suits}
+
+{emoji} {time} — {wave}m, {wind}km/h {wind_dir}
 {emoji} {time} — ...
 ...
 
-📝 *Summary*
-{2-3 sentences: overall vibe, best window, wind pattern, who it suits}
+Sea temperature: {temp}°C
 ```
 
-- Rating emoji leads each line — instant visual scan of when to go
-- Pipe-separated data stays compact on mobile
-- Wind emoji (💨) distinguishes wind from swell at a glance
+- Wave height (`wave_height`) is the displayed value, not swell height
+- Summary before intervals gives context for scanning
+- No pipe separators — comma-separated for compactness
 - Only include intervals 06:00–18:00 (daylight); skip 20:00
-- Bold the best window in the summary
+- Rating shown as emoji only (no `/5` number)
 
 ### Multi-day format (no `--date`, 8-day outlook)
 
 ```
-🏄 *{Location}* — {n}-Day Outlook
+🏄 {Location} — {n}-Day Outlook
 
-{best_emoji} *{Day Date}* — {wave_range}m | {swell_dir} {period}s | 🌊 {temp}°C | {one-line description}
-{best_emoji} *{Day Date}* — ...
-...
-
-📝 *Outlook*
 {3-4 sentences: trend through the week, best days highlighted, wind patterns}
+
+{best_emoji} {Day Date} — {wave_range}m, {wind_summary} | {one-line description}
+{best_emoji} {Day Date} — ...
+...
 ```
 
+- Summary before day lines gives context for scanning
 - One line per day with the day's peak rating emoji
-- Sea temp on each day line (may vary across the forecast window)
 - Wave range (e.g. "1.0–1.5m") gives the spread without hourly clutter
-- One-line description captures the character: "Clean early, SE onshore by noon", "Light winds all day ✨", "Choppy and blown out"
+- One-line description captures the character: "Clean early, SE onshore by noon", "Light winds all day", "Choppy and blown out"
 - Summary calls out the standout days explicitly
