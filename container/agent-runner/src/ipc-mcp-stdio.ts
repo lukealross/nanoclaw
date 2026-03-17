@@ -41,7 +41,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. To send an image, include [Image: attachments/filename.jpg] in the text — the host will detect it and send the file as a media message.",
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
@@ -329,6 +329,50 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+server.tool(
+  'set_profile_picture',
+  'Set the WhatsApp bot profile picture. Main group only. The image must be under /workspace/group/.',
+  {
+    image_path: z.string().describe('Absolute path to the image file (must be under /workspace/group/)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can set the profile picture.' }],
+        isError: true,
+      };
+    }
+
+    const imagePath = args.image_path;
+    if (!imagePath.startsWith('/workspace/group/')) {
+      return {
+        content: [{ type: 'text' as const, text: 'Image path must be under /workspace/group/.' }],
+        isError: true,
+      };
+    }
+
+    if (!fs.existsSync(imagePath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${imagePath}` }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'set_profile_picture',
+      imagePath,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: 'Profile picture update requested.' }],
     };
   },
 );

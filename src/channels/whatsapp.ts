@@ -299,6 +299,27 @@ export class WhatsAppChannel implements Channel {
     }
   }
 
+  async sendImage(jid: string, imagePath: string, caption?: string): Promise<void> {
+    const buffer = fs.readFileSync(imagePath);
+    const prefixedCaption = caption
+      ? (ASSISTANT_HAS_OWN_NUMBER ? caption : `${ASSISTANT_NAME}: ${caption}`)
+      : undefined;
+
+    if (!this.connected) {
+      logger.info(
+        { jid, imagePath, queueSize: this.outgoingQueue.length },
+        'WA disconnected, image send deferred',
+      );
+      return;
+    }
+    try {
+      await this.sock.sendMessage(jid, { image: buffer, caption: prefixedCaption });
+      logger.info({ jid, imagePath }, 'Image sent');
+    } catch (err) {
+      logger.warn({ jid, imagePath, err }, 'Failed to send image');
+    }
+  }
+
   isConnected(): boolean {
     return this.connected;
   }
@@ -310,6 +331,14 @@ export class WhatsAppChannel implements Channel {
   async disconnect(): Promise<void> {
     this.connected = false;
     this.sock?.end(undefined);
+  }
+
+  async setProfilePicture(imagePath: string): Promise<void> {
+    if (!this.connected) throw new Error('WhatsApp not connected');
+    const ownJid = this.sock.user?.id;
+    if (!ownJid) throw new Error('WhatsApp user JID not available');
+    await this.sock.updateProfilePicture(ownJid, { url: imagePath });
+    logger.info({ imagePath }, 'Profile picture updated');
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {

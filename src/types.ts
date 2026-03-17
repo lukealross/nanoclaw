@@ -88,6 +88,10 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: send an image file with an optional caption.
+  sendImage?(jid: string, imagePath: string, caption?: string): Promise<void>;
+  // Optional: update the bot's profile picture.
+  setProfilePicture?(imagePath: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

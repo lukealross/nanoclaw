@@ -6,12 +6,12 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendMessage: (jid: string, text: string, groupFolder?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -22,6 +22,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  setProfilePicture?: (imagePath: string) => Promise<void>;
 }
 
 let ipcWatcherRunning = false;
@@ -80,7 +81,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  await deps.sendMessage(data.chatJid, data.text, sourceGroup);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -171,6 +172,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    imagePath?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -412,6 +414,54 @@ export async function processTaskIpc(
           { sourceGroup },
           'Unauthorized refresh_groups attempt blocked',
         );
+      }
+      break;
+
+    case 'set_profile_picture':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized set_profile_picture attempt blocked',
+        );
+        break;
+      }
+      if (!deps.setProfilePicture) {
+        logger.warn('No channel supports setProfilePicture');
+        break;
+      }
+      if (!data.imagePath) {
+        logger.warn('set_profile_picture: missing imagePath');
+        break;
+      }
+      try {
+        // Resolve container path to host path
+        const groupDir = resolveGroupFolderPath(sourceGroup);
+        const hostPath = path.resolve(
+          groupDir,
+          data.imagePath.replace(/^\/workspace\/group\//, ''),
+        );
+        // Path traversal guard
+        if (!hostPath.startsWith(groupDir + path.sep) && hostPath !== groupDir) {
+          logger.warn(
+            { hostPath, groupDir },
+            'set_profile_picture: path traversal blocked',
+          );
+          break;
+        }
+        if (!fs.existsSync(hostPath)) {
+          logger.warn(
+            { hostPath },
+            'set_profile_picture: file not found on host',
+          );
+          break;
+        }
+        await deps.setProfilePicture(hostPath);
+        logger.info(
+          { sourceGroup, hostPath },
+          'Profile picture updated via IPC',
+        );
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'set_profile_picture failed');
       }
       break;
 

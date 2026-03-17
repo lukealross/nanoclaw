@@ -44,7 +44,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  routeOutboundWithImages,
+} from './router.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
@@ -227,7 +232,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(chatJid, text);
+          const groupDir = resolveGroupFolderPath(group.folder);
+          await routeOutboundWithImages(channel, chatJid, text, groupDir);
           outputSentToUser = true;
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -559,20 +565,31 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
+    sendMessage: async (jid, rawText, groupFolder) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
         logger.warn({ jid }, 'No channel owns JID, cannot send message');
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        if (groupFolder) {
+          const groupDir = resolveGroupFolderPath(groupFolder);
+          await routeOutboundWithImages(channel, jid, text, groupDir);
+        } else {
+          await channel.sendMessage(jid, text);
+        }
+      }
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, text, groupFolder) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (groupFolder) {
+        const groupDir = resolveGroupFolderPath(groupFolder);
+        return routeOutboundWithImages(channel, jid, text, groupDir);
+      }
       return channel.sendMessage(jid, text);
     },
     registeredGroups: () => registeredGroups,
@@ -587,6 +604,11 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    setProfilePicture: async (imagePath) => {
+      const ch = channels.find((c) => c.setProfilePicture);
+      if (!ch?.setProfilePicture) throw new Error('No channel supports profile picture');
+      return ch.setProfilePicture(imagePath);
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

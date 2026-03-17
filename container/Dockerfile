@@ -56,6 +56,10 @@ RUN npm run build
 COPY skills/weather/weather /usr/local/bin/weather
 RUN chmod +x /usr/local/bin/weather
 
+# Install generate-image CLI
+COPY skills/generate-image/generate-image /usr/local/bin/generate-image
+RUN chmod +x /usr/local/bin/generate-image
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
