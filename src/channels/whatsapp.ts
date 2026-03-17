@@ -299,10 +299,16 @@ export class WhatsAppChannel implements Channel {
     }
   }
 
-  async sendImage(jid: string, imagePath: string, caption?: string): Promise<void> {
+  async sendImage(
+    jid: string,
+    imagePath: string,
+    caption?: string,
+  ): Promise<void> {
     const buffer = fs.readFileSync(imagePath);
     const prefixedCaption = caption
-      ? (ASSISTANT_HAS_OWN_NUMBER ? caption : `${ASSISTANT_NAME}: ${caption}`)
+      ? ASSISTANT_HAS_OWN_NUMBER
+        ? caption
+        : `${ASSISTANT_NAME}: ${caption}`
       : undefined;
 
     if (!this.connected) {
@@ -313,7 +319,10 @@ export class WhatsAppChannel implements Channel {
       return;
     }
     try {
-      await this.sock.sendMessage(jid, { image: buffer, caption: prefixedCaption });
+      await this.sock.sendMessage(jid, {
+        image: buffer,
+        caption: prefixedCaption,
+      });
       logger.info({ jid, imagePath }, 'Image sent');
     } catch (err) {
       logger.warn({ jid, imagePath, err }, 'Failed to send image');

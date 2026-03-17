@@ -11,7 +11,11 @@ import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string, groupFolder?: string) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    groupFolder?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -441,7 +445,10 @@ export async function processTaskIpc(
           data.imagePath.replace(/^\/workspace\/group\//, ''),
         );
         // Path traversal guard
-        if (!hostPath.startsWith(groupDir + path.sep) && hostPath !== groupDir) {
+        if (
+          !hostPath.startsWith(groupDir + path.sep) &&
+          hostPath !== groupDir
+        ) {
           logger.warn(
             { hostPath, groupDir },
             'set_profile_picture: path traversal blocked',

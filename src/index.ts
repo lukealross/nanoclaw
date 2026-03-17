@@ -606,7 +606,8 @@ async function main(): Promise<void> {
       writeGroupsSnapshot(gf, im, ag, rj),
     setProfilePicture: async (imagePath) => {
       const ch = channels.find((c) => c.setProfilePicture);
-      if (!ch?.setProfilePicture) throw new Error('No channel supports profile picture');
+      if (!ch?.setProfilePicture)
+        throw new Error('No channel supports profile picture');
       return ch.setProfilePicture(imagePath);
     },
   });
