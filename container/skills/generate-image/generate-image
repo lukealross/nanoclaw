@@ -4,7 +4,17 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
+// Provider toggle: 'gemini' (default) or 'bfl' (legacy FLUX)
+const PROVIDER = process.env.IMAGE_PROVIDER || 'gemini';
+
 const BFL_API_BASE = 'https://api.bfl.ai/v1';
+
+// Gemini model mapping
+const GEMINI_MODELS = {
+  'nano-banana-2': 'gemini-3.1-flash-image-preview',
+  'nano-banana-pro': 'gemini-3-pro-image-preview',
+  'imagen-ultra': 'imagen-4.0-ultra',
+};
 
 function httpRequest(url, options, body) {
   return new Promise((resolve, reject) => {
@@ -48,6 +58,8 @@ function downloadToBuffer(url) {
   });
 }
 
+// --- BFL/FLUX functions (legacy) ---
+
 async function pollForResult(pollingUrl, apiKey) {
   const startTime = Date.now();
   const timeout = 120000;
@@ -78,52 +90,7 @@ async function pollForResult(pollingUrl, apiKey) {
   throw new Error('Generation timed out after 120 seconds');
 }
 
-function parseArgs(argv) {
-  const args = argv.slice(2);
-  if (args.length === 0) {
-    console.error('Usage:');
-    console.error('  generate-image generate "<prompt>" [--aspect 16:9|1:1|9:16|4:3|3:4]');
-    console.error('  generate-image edit <image-path> "<instruction>"');
-    process.exit(1);
-  }
-
-  const subcommand = args[0];
-  if (subcommand === 'generate') {
-    let prompt = '';
-    let aspect = '16:9';
-    for (let i = 1; i < args.length; i++) {
-      if (args[i] === '--aspect' && args[i + 1]) {
-        aspect = args[++i];
-      } else if (!prompt) {
-        prompt = args[i];
-      }
-    }
-    if (!prompt) {
-      console.error('Error: prompt is required for generate');
-      process.exit(1);
-    }
-    return { subcommand: 'generate', prompt, aspect };
-  } else if (subcommand === 'edit') {
-    const imagePath = args[1];
-    const instruction = args[2];
-    if (!imagePath || !instruction) {
-      console.error('Error: image-path and instruction are required for edit');
-      process.exit(1);
-    }
-    return { subcommand: 'edit', imagePath, instruction };
-  } else {
-    console.error(`Unknown subcommand: ${subcommand}`);
-    process.exit(1);
-  }
-}
-
-function generateOutputPath() {
-  const timestamp = Date.now();
-  const random = Math.random().toString(36).slice(2, 8);
-  return `attachments/gen-${timestamp}-${random}.jpg`;
-}
-
-async function generateImage(prompt, aspect, apiKey) {
+async function bflGenerateImage(prompt, aspect, apiKey) {
   const body = JSON.stringify({
     prompt,
     aspect_ratio: aspect,
@@ -146,8 +113,7 @@ async function generateImage(prompt, aspect, apiKey) {
   return result.sample;
 }
 
-async function editImage(imagePath, instruction, apiKey) {
-  // Resolve path relative to /workspace/group/ if not absolute
+async function bflEditImage(imagePath, instruction, apiKey) {
   const fullPath = path.isAbsolute(imagePath)
     ? imagePath
     : path.join('/workspace/group', imagePath);
@@ -183,33 +149,216 @@ async function editImage(imagePath, instruction, apiKey) {
   return result.sample;
 }
 
-async function main() {
-  const apiKey = process.env.BFL_API_KEY;
-  if (!apiKey) {
-    console.error('Error: BFL_API_KEY environment variable is not set');
+// --- Gemini functions ---
+
+async function geminiGenerateImage(prompt, aspect, model, apiKey) {
+  const modelId = GEMINI_MODELS[model];
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: {
+        aspectRatio: aspect,
+        imageSize: '1K',
+      },
+    },
+  });
+
+  const res = await httpRequest(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }, body);
+
+  return parseGeminiImageResponse(res.data);
+}
+
+async function geminiEditImage(imagePath, instruction, model, apiKey) {
+  if (model === 'imagen-ultra') {
+    throw new Error('imagen-ultra does not support editing. Use --model nano-banana-pro instead.');
+  }
+
+  const fullPath = path.isAbsolute(imagePath)
+    ? imagePath
+    : path.join('/workspace/group', imagePath);
+
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`Image not found: ${fullPath}`);
+  }
+
+  const imageBuffer = fs.readFileSync(fullPath);
+  const ext = path.extname(fullPath).toLowerCase();
+  const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+  const base64Image = imageBuffer.toString('base64');
+
+  const modelId = GEMINI_MODELS[model];
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${apiKey}`;
+
+  const body = JSON.stringify({
+    contents: [{
+      parts: [
+        { inlineData: { mimeType: mimeType, data: base64Image } },
+        { text: instruction },
+      ],
+    }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: {
+        imageSize: '1K',
+      },
+    },
+  });
+
+  const res = await httpRequest(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }, body);
+
+  return parseGeminiImageResponse(res.data);
+}
+
+function parseGeminiImageResponse(responseData) {
+  const parsed = JSON.parse(responseData);
+
+  if (!parsed.candidates || !parsed.candidates[0] || !parsed.candidates[0].content) {
+    throw new Error(`Gemini API error: ${JSON.stringify(parsed)}`);
+  }
+
+  const parts = parsed.candidates[0].content.parts;
+  const imagePart = parts.find((p) => p.inlineData);
+
+  if (!imagePart) {
+    // Check if there's a text-only response (e.g. refusal)
+    const textPart = parts.find((p) => p.text);
+    if (textPart) {
+      throw new Error(`No image generated. Model response: ${textPart.text}`);
+    }
+    throw new Error('No image data in Gemini response');
+  }
+
+  return Buffer.from(imagePart.inlineData.data, 'base64');
+}
+
+// --- CLI ---
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  if (args.length === 0) {
+    console.error('Usage:');
+    console.error('  generate-image generate "<prompt>" [--aspect 16:9|1:1|9:16|4:3|3:4] [--model nano-banana-2|nano-banana-pro|imagen-ultra]');
+    console.error('  generate-image edit <image-path> "<instruction>" [--model nano-banana-2|nano-banana-pro]');
     process.exit(1);
   }
 
-  const parsed = parseArgs(process.argv);
-  let imageUrl;
-
-  if (parsed.subcommand === 'generate') {
-    imageUrl = await generateImage(parsed.prompt, parsed.aspect, apiKey);
+  const subcommand = args[0];
+  if (subcommand === 'generate') {
+    let prompt = '';
+    let aspect = '16:9';
+    let model = 'nano-banana-pro';
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--aspect' && args[i + 1]) {
+        aspect = args[++i];
+      } else if (args[i] === '--model' && args[i + 1]) {
+        model = args[++i];
+      } else if (!prompt) {
+        prompt = args[i];
+      }
+    }
+    if (!prompt) {
+      console.error('Error: prompt is required for generate');
+      process.exit(1);
+    }
+    return { subcommand: 'generate', prompt, aspect, model };
+  } else if (subcommand === 'edit') {
+    let imagePath = '';
+    let instruction = '';
+    let model = 'nano-banana-pro';
+    let positionalIndex = 0;
+    for (let i = 1; i < args.length; i++) {
+      if (args[i] === '--model' && args[i + 1]) {
+        model = args[++i];
+      } else if (positionalIndex === 0) {
+        imagePath = args[i];
+        positionalIndex++;
+      } else if (positionalIndex === 1) {
+        instruction = args[i];
+        positionalIndex++;
+      }
+    }
+    if (!imagePath || !instruction) {
+      console.error('Error: image-path and instruction are required for edit');
+      process.exit(1);
+    }
+    return { subcommand: 'edit', imagePath, instruction, model };
   } else {
-    imageUrl = await editImage(parsed.imagePath, parsed.instruction, apiKey);
+    console.error(`Unknown subcommand: ${subcommand}`);
+    process.exit(1);
   }
+}
 
-  // Download the result image
-  const imageBuffer = await downloadToBuffer(imageUrl);
+function generateOutputPath() {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).slice(2, 8);
+  return `attachments/gen-${timestamp}-${random}.jpg`;
+}
 
-  // Save to attachments directory
-  const outputPath = generateOutputPath();
-  const fullOutputPath = path.join('/workspace/group', outputPath);
-  fs.mkdirSync(path.dirname(fullOutputPath), { recursive: true });
-  fs.writeFileSync(fullOutputPath, imageBuffer);
+async function main() {
+  const parsed = parseArgs(process.argv);
 
-  // Print the reference for the agent to include in its response
-  console.log(`[Image: ${outputPath}]`);
+  if (PROVIDER === 'gemini') {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error('Error: GEMINI_API_KEY environment variable is not set');
+      process.exit(1);
+    }
+
+    // Validate model name
+    if (!GEMINI_MODELS[parsed.model]) {
+      console.error(`Error: unknown model "${parsed.model}". Valid models: ${Object.keys(GEMINI_MODELS).join(', ')}`);
+      process.exit(1);
+    }
+
+    let imageBuffer;
+    if (parsed.subcommand === 'generate') {
+      imageBuffer = await geminiGenerateImage(parsed.prompt, parsed.aspect, parsed.model, apiKey);
+    } else {
+      imageBuffer = await geminiEditImage(parsed.imagePath, parsed.instruction, parsed.model, apiKey);
+    }
+
+    // Save to attachments directory
+    const outputPath = generateOutputPath();
+    const fullOutputPath = path.join('/workspace/group', outputPath);
+    fs.mkdirSync(path.dirname(fullOutputPath), { recursive: true });
+    fs.writeFileSync(fullOutputPath, imageBuffer);
+
+    console.log(`[Image: ${outputPath}]`);
+  } else {
+    // BFL/FLUX provider
+    const apiKey = process.env.BFL_API_KEY;
+    if (!apiKey) {
+      console.error('Error: BFL_API_KEY environment variable is not set');
+      process.exit(1);
+    }
+
+    let imageUrl;
+    if (parsed.subcommand === 'generate') {
+      imageUrl = await bflGenerateImage(parsed.prompt, parsed.aspect, apiKey);
+    } else {
+      imageUrl = await bflEditImage(parsed.imagePath, parsed.instruction, apiKey);
+    }
+
+    // Download the result image
+    const imageBuffer = await downloadToBuffer(imageUrl);
+
+    // Save to attachments directory
+    const outputPath = generateOutputPath();
+    const fullOutputPath = path.join('/workspace/group', outputPath);
+    fs.mkdirSync(path.dirname(fullOutputPath), { recursive: true });
+    fs.writeFileSync(fullOutputPath, imageBuffer);
+
+    console.log(`[Image: ${outputPath}]`);
+  }
 }
 
 main().catch((err) => {

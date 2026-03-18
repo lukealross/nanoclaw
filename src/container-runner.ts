@@ -229,6 +229,12 @@ function buildContainerArgs(
     args.push('-e', `BFL_API_KEY=${bflSecrets.BFL_API_KEY}`);
   }
 
+  // Inject Gemini API key for image generation (Nano Banana / Imagen)
+  const geminiSecrets = readEnvFile(['GEMINI_API_KEY']);
+  if (geminiSecrets.GEMINI_API_KEY) {
+    args.push('-e', `GEMINI_API_KEY=${geminiSecrets.GEMINI_API_KEY}`);
+  }
+
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',
