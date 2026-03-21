@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Doodles",
+    "aliases": ["doodles"],
+    "lat": -33.810, "lon": 18.469,
+    "coastFacing": 250,
+    "swellWindow": [200, 300],
+    "breakType": "beach",
+    "optimalTide": [0.1, 0.5],
+    "notes": "Offshore on ENE winds. Rocky reef offshore produces long rides on bigger swell. Gentle takeoff — good for progression. No wind or light SE ideal."
+  },
+  {
+    "name": "Big Bay",
+    "aliases": ["big bay", "blouberg", "bloubergstrand"],
+    "lat": -33.799, "lon": 18.459,
+    "coastFacing": 250,
+    "swellWindow": [200, 300],
+    "breakType": "beach",
+    "optimalTide": [0.2, 0.9],
+    "notes": "Offshore on ENE winds. Exposed to SW groundswell. Works at all tides. Popular kite spot — often windy."
+  },
+  {
+    "name": "Derdesteen",
+    "aliases": ["derdesteen", "derde steen"],
+    "lat": -33.761, "lon": 18.442,
+    "coastFacing": 270,
+    "swellWindow": [200, 310],
+    "breakType": "beach",
+    "optimalTide": [0.1, 0.5],
+    "notes": "Offshore on ENE winds. Fast hollow lefts, shorter powerful rights. Dangerous rips. Can't handle very large swell — best at 2-4ft. Go early to beat crowds and wind."
+  },
+  {
+    "name": "Melkbosstrand",
+    "aliases": ["melkbos", "melkbosstrand"],
+    "lat": -33.722, "lon": 18.446,
+    "coastFacing": 270,
+    "swellWindow": [200, 310],
+    "breakType": "beach",
+    "optimalTide": [0.4, 0.8],
+    "notes": "Offshore on NE/SE winds. Needs solid swell to fire. Tube Wave = quality barrel on big days. Heavy rip on pushing tide."
+  }
+]
