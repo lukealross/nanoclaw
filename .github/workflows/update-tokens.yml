@@ -8,6 +8,7 @@ on:
 
 jobs:
   update-tokens:
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v1
