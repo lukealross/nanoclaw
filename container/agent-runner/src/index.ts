@@ -550,7 +550,19 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      let queryResult;
+      try {
+        queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      } catch (queryErr) {
+        const queryErrMsg = queryErr instanceof Error ? queryErr.message : String(queryErr);
+        if (sessionId && queryErrMsg.includes('No conversation found')) {
+          log(`Session ${sessionId} not found, retrying with new session...`);
+          sessionId = undefined;
+          resumeAt = undefined;
+          continue;
+        }
+        throw queryErr;
+      }
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }

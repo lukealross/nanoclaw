@@ -49,7 +49,7 @@ Use these WhatsApp-friendly templates for all surf forecast responses.
 
 {2-3 sentences: overall vibe, best window, wind type pattern (offshore/onshore), swell window fit, tide influence}
 
-{emoji} {time} — {wave}m, {swell}m@{period}s {swell_dir} {✓/~/✗}, {wind}km/h {wind_dir} ({wind_type}), {tide_state}
+{emoji} {time} — {wave}m, {swell}m@{period}s {swell_dir}, {wind}km/h {wind_dir} ({wind_type}), {tide_state}
 {emoji} {time} — ...
 ...
 
@@ -59,6 +59,7 @@ Sea temperature: {temp}°C
 **Without spot profile:**
 ```
 🏄 {Location} — {Day Date}
+ℹ️ No local spot profile — raw data only, no ratings.
 
 {2-3 sentences: general conditions, note that spot-specific ratings unavailable}
 
@@ -93,6 +94,7 @@ Sea temperature: {temp}°C
 **Without spot profile:**
 ```
 🏄 {Location} — {n}-Day Outlook
+ℹ️ No local spot profile — raw data only, no ratings.
 
 {3-4 sentences: general trend, note that spot-specific ratings unavailable}
 

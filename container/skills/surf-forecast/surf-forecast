@@ -379,6 +379,8 @@ function buildReport(geo, marine, wind, tideData, spot, singleDate) {
     lines.push(`${spot.breakType.charAt(0).toUpperCase() + spot.breakType.slice(1)} break facing ${compassDir(spot.coastFacing)} | Best swell: ${swellMinCompass}-${swellMaxCompass} | Offshore wind: ${offshoreCompass}`);
     if (spot.notes) lines.push(spot.notes);
     lines.push('📍 Matched local spot profile — ratings use local knowledge for this break.');
+  } else {
+    lines.push('ℹ️ No local spot profile found — returning raw data without condition ratings.');
   }
 
   // Current conditions (multi-day mode only)
@@ -485,11 +487,6 @@ function buildReport(geo, marine, wind, tideData, spot, singleDate) {
     }
   }
 
-  if (!hasSpot) {
-    lines.push('');
-    lines.push('Note: No spot profile matched — showing raw data without condition ratings.');
-    lines.push('Ratings require spot-specific data (coastline facing, swell window, break type).');
-  }
 
   return lines.join('\n');
 }

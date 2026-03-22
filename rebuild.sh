@@ -6,6 +6,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+echo "==> Building TypeScript..."
+npm run build
+
 echo "==> Rebuilding container image..."
 bash container/build.sh "$@"
 
