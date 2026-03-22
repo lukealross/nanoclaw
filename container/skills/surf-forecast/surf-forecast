@@ -292,21 +292,43 @@ async function geocode(location, { multiple = false } = {}) {
 }
 
 async function fetchMarine(lat, lon, timezone, date) {
+  // Use GWAM (Global Wave Model) for accurate peak period data
   const params = new URLSearchParams({
     latitude: lat, longitude: lon, timezone,
+    models: 'gwam',
     hourly: [
       'wave_height',
       'swell_wave_height', 'swell_wave_period', 'swell_wave_direction',
       'swell_wave_peak_period',
       'secondary_swell_wave_height', 'secondary_swell_wave_period', 'secondary_swell_wave_direction',
-      'sea_surface_temperature',
     ].join(','),
   });
   if (date) { params.set('start_date', date); params.set('end_date', date); }
   else { params.set('forecast_days', '8'); }
   const res = await fetch(`https://marine-api.open-meteo.com/v1/marine?${params}`);
   if (!res.ok) throw new Error(`Marine API failed: ${res.status}`);
-  return res.json();
+  const data = await res.json();
+
+  // GWAM doesn't provide SST — fetch separately from best_match
+  const sstParams = new URLSearchParams({
+    latitude: lat, longitude: lon, timezone,
+    hourly: 'sea_surface_temperature',
+  });
+  if (date) { sstParams.set('start_date', date); sstParams.set('end_date', date); }
+  else { sstParams.set('forecast_days', '8'); }
+  try {
+    const sstRes = await fetch(`https://marine-api.open-meteo.com/v1/marine?${sstParams}`);
+    if (sstRes.ok) {
+      const sstData = await sstRes.json();
+      data.hourly.sea_surface_temperature = sstData.hourly.sea_surface_temperature;
+    } else {
+      data.hourly.sea_surface_temperature = [];
+    }
+  } catch {
+    data.hourly.sea_surface_temperature = [];
+  }
+
+  return data;
 }
 
 async function fetchWind(lat, lon, timezone, date) {
