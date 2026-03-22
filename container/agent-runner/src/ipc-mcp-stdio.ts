@@ -377,6 +377,32 @@ server.tool(
   },
 );
 
+server.tool(
+  'rebuild_and_restart',
+  'Rebuild the container image and restart the host process. Main group only. Use when container skills or tools have been updated and need to be deployed.',
+  {},
+  async () => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can trigger rebuild and restart.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'rebuild_and_restart',
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: 'Rebuild and restart requested. The container image will be rebuilt and the host process will restart.' }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

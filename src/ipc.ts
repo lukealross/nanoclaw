@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -509,6 +510,46 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'rebuild_and_restart':
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized rebuild_and_restart attempt blocked',
+        );
+        break;
+      }
+      {
+        const mainJid = Object.keys(registeredGroups).find(
+          (jid) => registeredGroups[jid].isMain,
+        );
+        const notify = async (text: string) => {
+          if (mainJid) await deps.sendMessage(mainJid, text, sourceGroup);
+        };
+
+        logger.info({ sourceGroup }, 'Rebuild and restart requested via IPC');
+        await notify('🔨 Rebuilding container image...');
+
+        const buildScript = path.resolve(process.cwd(), 'container', 'build.sh');
+        const build = spawn('bash', [buildScript], { stdio: 'pipe' });
+
+        build.on('close', async (code) => {
+          if (code === 0) {
+            await notify('✅ Build complete. Restarting...');
+            logger.info('Build succeeded, restarting process');
+            process.exit(0);
+          } else {
+            logger.error({ code }, 'Container build failed');
+            await notify(`❌ Build failed (exit ${code}). Check logs.`);
+          }
+        });
+
+        build.on('error', async (err) => {
+          logger.error({ err }, 'Failed to spawn build script');
+          await notify(`❌ Build error: ${err.message}`);
+        });
       }
       break;
 
