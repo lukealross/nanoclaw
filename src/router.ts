@@ -55,10 +55,34 @@ export function findChannel(
   return channels.find((c) => c.ownsJid(jid));
 }
 
+const MIME_MAP: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.csv': 'text/csv',
+  '.txt': 'text/plain',
+  '.zip': 'application/zip',
+  '.gz': 'application/gzip',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.html': 'text/html',
+  '.mp3': 'audio/mpeg',
+  '.mp4': 'video/mp4',
+};
+
+function getMimetype(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  return MIME_MAP[ext] || 'application/octet-stream';
+}
+
 /**
- * Route outbound text, detecting [Image: attachments/...] references.
- * Text segments are sent as messages; image references are sent via sendImage.
- * Falls back to plain text if the channel doesn't support sendImage.
+ * Route outbound text, detecting [Image: attachments/...] and [File: attachments/...] references.
+ * Text segments are sent as messages; media references are sent via sendImage/sendDocument.
+ * Falls back to plain text if the channel doesn't support the media type.
  */
 export async function routeOutboundWithImages(
   channel: Channel,
@@ -66,37 +90,44 @@ export async function routeOutboundWithImages(
   text: string,
   groupDir: string,
 ): Promise<void> {
-  if (!channel.sendImage) {
-    // Channel doesn't support images — send as plain text
+  if (!channel.sendImage && !channel.sendDocument) {
     await channel.sendMessage(jid, text);
     return;
   }
 
-  // Split on [Image: attachments/...] patterns
-  const imagePattern = /\[Image:\s*(attachments\/[^\]]+)\]/g;
+  // Match both [Image: attachments/...] and [File: attachments/...] in order
+  const mediaPattern = /\[(Image|File):\s*(attachments\/[^\]]+)\]/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = imagePattern.exec(text)) !== null) {
-    // Send any text before this image reference
+  while ((match = mediaPattern.exec(text)) !== null) {
     const before = text.slice(lastIndex, match.index).trim();
     if (before) {
       await channel.sendMessage(jid, before);
     }
 
-    // Send the image
-    const relativePath = match[1];
-    const imagePath = path.join(groupDir, relativePath);
-    if (fs.existsSync(imagePath)) {
-      await channel.sendImage(jid, imagePath);
+    const type = match[1]; // "Image" or "File"
+    const relativePath = match[2];
+    const fullPath = path.join(groupDir, relativePath);
+
+    if (fs.existsSync(fullPath)) {
+      if (type === 'Image' && channel.sendImage) {
+        await channel.sendImage(jid, fullPath);
+      } else if (type === 'File' && channel.sendDocument) {
+        const mimetype = getMimetype(fullPath);
+        const fileName = path.basename(fullPath);
+        await channel.sendDocument(jid, fullPath, mimetype, fileName);
+      } else {
+        // Channel doesn't support this type — mention it in text
+        await channel.sendMessage(jid, `[Unsupported: ${path.basename(fullPath)}]`);
+      }
     } else {
-      logger.warn({ imagePath }, 'Image file not found, skipping');
+      logger.warn({ fullPath, type }, 'Media file not found, skipping');
     }
 
     lastIndex = match.index + match[0].length;
   }
 
-  // Send any remaining text after the last image reference
   const remaining = text.slice(lastIndex).trim();
   if (remaining) {
     await channel.sendMessage(jid, remaining);

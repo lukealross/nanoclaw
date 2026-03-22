@@ -532,7 +532,11 @@ export async function processTaskIpc(
         logger.info({ sourceGroup }, 'Rebuild and restart requested via IPC');
         await notify('🔨 Rebuilding container image...');
 
-        const buildScript = path.resolve(process.cwd(), 'container', 'build.sh');
+        const buildScript = path.resolve(
+          process.cwd(),
+          'container',
+          'build.sh',
+        );
         const build = spawn('bash', [buildScript], { stdio: 'pipe' });
 
         build.on('close', async (code) => {

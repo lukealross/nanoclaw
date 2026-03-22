@@ -90,6 +90,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: send an image file with an optional caption.
   sendImage?(jid: string, imagePath: string, caption?: string): Promise<void>;
+  // Optional: send a document/file with mimetype and filename.
+  sendDocument?(jid: string, filePath: string, mimetype: string, fileName: string, caption?: string): Promise<void>;
   // Optional: update the bot's profile picture.
   setProfilePicture?(imagePath: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
