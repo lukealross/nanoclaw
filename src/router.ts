@@ -58,11 +58,13 @@ export function findChannel(
 const MIME_MAP: Record<string, string> = {
   '.pdf': 'application/pdf',
   '.doc': 'application/msword',
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.docx':
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.xls': 'application/vnd.ms-excel',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   '.ppt': 'application/vnd.ms-powerpoint',
-  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.pptx':
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.csv': 'text/csv',
   '.txt': 'text/plain',
   '.zip': 'application/zip',
@@ -119,7 +121,10 @@ export async function routeOutboundWithImages(
         await channel.sendDocument(jid, fullPath, mimetype, fileName);
       } else {
         // Channel doesn't support this type — mention it in text
-        await channel.sendMessage(jid, `[Unsupported: ${path.basename(fullPath)}]`);
+        await channel.sendMessage(
+          jid,
+          `[Unsupported: ${path.basename(fullPath)}]`,
+        );
       }
     } else {
       logger.warn({ fullPath, type }, 'Media file not found, skipping');

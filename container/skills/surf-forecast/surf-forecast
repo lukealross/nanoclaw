@@ -146,10 +146,16 @@ function rateConditions(swellH, swellP, windSpeed, windDir, swellDir, spot, norm
   const wind = windScore(windSpeed, windDir, spot, swellDir);
   const tide = tideScore(normalizedTide, spot);
 
-  // Override: swell completely outside window
+  // Veto: swell completely outside window
   if (direction === 0) return { rating: 1, swell, direction, wind, tide };
 
-  const raw = swell * 0.35 + direction * 0.25 + wind * 0.25 + tide * 0.15;
+  // Stage 1: base score from swell factors + tide (wind excluded)
+  const base = swell * 0.45 + direction * 0.35 + tide * 0.20;
+
+  // Stage 2: wind acts as a ceiling
+  // Wind score 5 = no cap, wind score 0.5 = cap at 1
+  const raw = Math.min(base, wind);
+
   const rating = Math.max(1, Math.min(5, Math.round(raw)));
   return { rating, swell, direction, wind, tide };
 }
@@ -181,9 +187,9 @@ function swellWindowSymbol(swellDir, spot) {
 
 function tideStateLabel(normalized) {
   if (normalized == null) return '';
-  if (normalized < 0.33) return 'Low';
-  if (normalized < 0.66) return 'Mid';
-  return 'High';
+  if (normalized < 0.33) return 'low';
+  if (normalized < 0.66) return 'mid';
+  return 'high';
 }
 
 function computeTideNormals(seaLevels, times) {
@@ -217,8 +223,8 @@ function tideMovement(normals, i) {
   // Look back up to 2 indices for a non-null value
   for (let j = i - 1; j >= Math.max(0, i - 2); j--) {
     if (normals[j] != null) {
-      if (normals[i] > normals[j] + 0.02) return 'Rising';
-      if (normals[i] < normals[j] - 0.02) return 'Falling';
+      if (normals[i] > normals[j] + 0.02) return 'rising';
+      if (normals[i] < normals[j] - 0.02) return 'falling';
       return '';
     }
   }
@@ -372,6 +378,7 @@ function buildReport(geo, marine, wind, tideData, spot, singleDate) {
     const swellMaxCompass = compassDir(spot.swellWindow[1]);
     lines.push(`${spot.breakType.charAt(0).toUpperCase() + spot.breakType.slice(1)} break facing ${compassDir(spot.coastFacing)} | Best swell: ${swellMinCompass}-${swellMaxCompass} | Offshore wind: ${offshoreCompass}`);
     if (spot.notes) lines.push(spot.notes);
+    lines.push('📍 Matched local spot profile — ratings use local knowledge for this break.');
   }
 
   // Current conditions (multi-day mode only)
