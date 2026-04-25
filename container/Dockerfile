@@ -62,6 +62,10 @@ RUN chmod +x /usr/local/bin/weather
 COPY skills/generate-image/generate-image /usr/local/bin/generate-image
 RUN chmod +x /usr/local/bin/generate-image
 
+# Install tender-search CLI (queries host's Typesense via host.docker.internal)
+COPY skills/tender-search/tender-search /usr/local/bin/tender-search
+RUN chmod +x /usr/local/bin/tender-search
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 

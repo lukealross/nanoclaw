@@ -235,6 +235,13 @@ function buildContainerArgs(
     args.push('-e', `GEMINI_API_KEY=${geminiSecrets.GEMINI_API_KEY}`);
   }
 
+  // Inject Typesense API key for tender-search skill.
+  // Container reaches the host's Typesense via host.docker.internal (default in the binary).
+  const typesenseSecrets = readEnvFile(['TYPESENSE_API_KEY']);
+  if (typesenseSecrets.TYPESENSE_API_KEY) {
+    args.push('-e', `TYPESENSE_API_KEY=${typesenseSecrets.TYPESENSE_API_KEY}`);
+  }
+
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',

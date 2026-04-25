@@ -1,0 +1,437 @@
+#!/usr/bin/env node
+// tender-search: thin CLI over a host-side Typesense `tenders` collection.
+// Ports the logic from dottedl-fts/src/mcp/{search,filters,get}.ts so the
+// agent gets the same multi-search dedup, filter escaping, and date handling
+// without having to reconstruct it via raw curl on every call.
+
+const HOST = process.env.TYPESENSE_HOST || 'host.docker.internal';
+const PORT = process.env.TYPESENSE_PORT || '8108';
+const PROTOCOL = process.env.TYPESENSE_PROTOCOL || 'http';
+const COLLECTION = process.env.TYPESENSE_COLLECTION || 'tenders';
+const API_KEY = process.env.TYPESENSE_API_KEY;
+
+function die(msg, code = 1) {
+  process.stderr.write(`tender-search: ${msg}\n`);
+  process.exit(code);
+}
+
+if (!API_KEY) die('Missing required env var: TYPESENSE_API_KEY');
+
+const BASE_URL = `${PROTOCOL}://${HOST}:${PORT}`;
+
+async function tsFetch(path, options = {}) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      'X-TYPESENSE-API-KEY': API_KEY,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
+  if (!res.ok) {
+    const msg = (json && json.message) || text || `HTTP ${res.status}`;
+    throw new Error(`Typesense ${res.status}: ${msg}`);
+  }
+  return json;
+}
+
+function escapeValue(value) {
+  const s = String(value);
+  if (/[\s,&|()[\]:]/.test(s)) {
+    return '`' + s.replace(/`/g, '') + '`';
+  }
+  return s;
+}
+
+function pushDate(parts, field, op, iso) {
+  if (!iso) return;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) die(`Invalid ISO date for ${field}: "${iso}"`);
+  parts.push(`${field}:${op}${Math.floor(ms / 1000)}`);
+}
+
+function buildFilterBy(f) {
+  if (!f) return undefined;
+  const parts = [];
+
+  if (f.stage) parts.push(`stage:=${escapeValue(f.stage)}`);
+  if (f.status) parts.push(`status:=${escapeValue(f.status)}`);
+  if (f.main_category) parts.push(`main_category:=${escapeValue(f.main_category)}`);
+  if (f.procurement_method) parts.push(`procurement_method:=${escapeValue(f.procurement_method)}`);
+
+  if (f.notice_type) {
+    const arr = Array.isArray(f.notice_type) ? f.notice_type : [f.notice_type];
+    if (arr.length === 1) parts.push(`notice_type:=${escapeValue(arr[0])}`);
+    else if (arr.length > 1) parts.push(`notice_type:=[${arr.map(escapeValue).join(',')}]`);
+  }
+
+  if (f.is_framework !== undefined) parts.push(`is_framework:=${f.is_framework}`);
+  if (f.is_dps !== undefined) parts.push(`is_dps:=${f.is_dps}`);
+  if (f.above_threshold !== undefined) parts.push(`above_threshold:=${f.above_threshold}`);
+  if (f.suitable_for_sme !== undefined) parts.push(`suitable_for_sme:=${f.suitable_for_sme}`);
+  if (f.suitable_for_vcse !== undefined) parts.push(`suitable_for_vcse:=${f.suitable_for_vcse}`);
+  if (f.has_options !== undefined) parts.push(`has_options:=${f.has_options}`);
+
+  if (f.award_criteria_types && f.award_criteria_types.length) {
+    parts.push(`award_criteria_types:=[${f.award_criteria_types.map(escapeValue).join(',')}]`);
+  }
+  if (f.selection_criteria_types && f.selection_criteria_types.length) {
+    parts.push(`selection_criteria_types:=[${f.selection_criteria_types.map(escapeValue).join(',')}]`);
+  }
+
+  if (f.language) parts.push(`language:=${escapeValue(f.language)}`);
+
+  if (f.buyer_type && f.buyer_type.length) {
+    parts.push(`buyer_type:=[${f.buyer_type.map(escapeValue).join(',')}]`);
+  }
+  if (f.cpv_codes && f.cpv_codes.length) {
+    parts.push(`cpv_codes:=[${f.cpv_codes.map(escapeValue).join(',')}]`);
+  }
+  if (f.regions && f.regions.length) {
+    parts.push(`regions:=[${f.regions.map(escapeValue).join(',')}]`);
+  }
+
+  if (f.buyer_contains) parts.push(`buyer:${escapeValue(f.buyer_contains)}`);
+  if (f.supplier_contains) parts.push(`supplier_names:${escapeValue(f.supplier_contains)}`);
+
+  if (f.buyer_id) parts.push(`buyer_id:=${escapeValue(f.buyer_id)}`);
+  if (f.notice_id) parts.push(`notice_id:=${escapeValue(f.notice_id)}`);
+  if (f.ocid) parts.push(`ocid:=${escapeValue(f.ocid)}`);
+  if (f.buyer_reference) parts.push(`buyer_reference:=${escapeValue(f.buyer_reference)}`);
+
+  if (f.min_value !== undefined) parts.push(`value_amount:>=${f.min_value}`);
+  if (f.max_value !== undefined) parts.push(`value_amount:<=${f.max_value}`);
+  if (f.min_awarded_amount !== undefined) parts.push(`awarded_amount:>=${f.min_awarded_amount}`);
+  if (f.max_awarded_amount !== undefined) parts.push(`awarded_amount:<=${f.max_awarded_amount}`);
+
+  pushDate(parts, 'published_date', '>=', f.published_after);
+  pushDate(parts, 'published_date', '<=', f.published_before);
+  pushDate(parts, 'deadline_date', '>=', f.deadline_after);
+  pushDate(parts, 'deadline_date', '<=', f.deadline_before);
+  pushDate(parts, 'award_date', '>=', f.award_after);
+  pushDate(parts, 'award_date', '<=', f.award_before);
+  pushDate(parts, 'future_notice_date', '>=', f.future_notice_after);
+  pushDate(parts, 'future_notice_date', '<=', f.future_notice_before);
+  pushDate(parts, 'expression_of_interest_deadline', '>=', f.eoi_deadline_after);
+  pushDate(parts, 'expression_of_interest_deadline', '<=', f.eoi_deadline_before);
+  pushDate(parts, 'framework_end_date', '>=', f.framework_end_after);
+  pushDate(parts, 'framework_end_date', '<=', f.framework_end_before);
+
+  return parts.length ? parts.join(' && ') : undefined;
+}
+
+const DATE_FIELDS = [
+  'published_date',
+  'deadline_date',
+  'award_date',
+  'future_notice_date',
+  'expression_of_interest_deadline',
+  'framework_end_date',
+];
+const FACET_FIELDS = [
+  'stage','main_category','procurement_method','notice_type','is_framework','is_dps',
+  'above_threshold','suitable_for_sme','suitable_for_vcse','buyer_type','cpv_codes','regions',
+];
+const DESCRIPTION_MAX = 500;
+
+function unixToIso(seconds) {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function formatResult(doc) {
+  const out = { ...doc };
+  for (const field of DATE_FIELDS) {
+    if (typeof out[field] === 'number') out[field] = unixToIso(out[field]);
+  }
+  if (typeof out.description === 'string' && out.description.length > DESCRIPTION_MAX) {
+    out.description = out.description.slice(0, DESCRIPTION_MAX) + '…';
+  }
+  delete out.id;
+  return out;
+}
+
+function formatGetDoc(doc, includeRawOcds) {
+  const out = { ...doc };
+  for (const field of DATE_FIELDS) {
+    if (typeof out[field] === 'number') out[field] = unixToIso(out[field]);
+  }
+  if (typeof out.tender_documents === 'string') {
+    try { out.tender_documents = JSON.parse(out.tender_documents); } catch {}
+  }
+  if (includeRawOcds && typeof out.raw_ocds === 'string') {
+    try { out.raw_ocds = JSON.parse(out.raw_ocds); } catch {}
+  } else {
+    delete out.raw_ocds;
+  }
+  delete out.id;
+  return out;
+}
+
+const ARRAY_FILTERS = {
+  '--notice-type': 'notice_type',
+  '--award-criteria-type': 'award_criteria_types',
+  '--selection-criteria-type': 'selection_criteria_types',
+  '--buyer-type': 'buyer_type',
+  '--cpv': 'cpv_codes',
+  '--region': 'regions',
+};
+const STRING_FILTERS = {
+  '--stage': 'stage',
+  '--status': 'status',
+  '--main-category': 'main_category',
+  '--procurement-method': 'procurement_method',
+  '--language': 'language',
+  '--buyer-contains': 'buyer_contains',
+  '--supplier-contains': 'supplier_contains',
+  '--buyer-id': 'buyer_id',
+  '--buyer-reference': 'buyer_reference',
+  '--notice-id': 'notice_id',
+  '--ocid': 'ocid',
+  '--published-after': 'published_after',
+  '--published-before': 'published_before',
+  '--deadline-after': 'deadline_after',
+  '--deadline-before': 'deadline_before',
+  '--award-after': 'award_after',
+  '--award-before': 'award_before',
+  '--future-notice-after': 'future_notice_after',
+  '--future-notice-before': 'future_notice_before',
+  '--eoi-deadline-after': 'eoi_deadline_after',
+  '--eoi-deadline-before': 'eoi_deadline_before',
+  '--framework-end-after': 'framework_end_after',
+  '--framework-end-before': 'framework_end_before',
+};
+const NUMERIC_FILTERS = {
+  '--min-value': 'min_value',
+  '--max-value': 'max_value',
+  '--min-awarded': 'min_awarded_amount',
+  '--max-awarded': 'max_awarded_amount',
+};
+const BOOLEAN_FILTERS = {
+  '--is-framework': 'is_framework',
+  '--is-dps': 'is_dps',
+  '--above-threshold': 'above_threshold',
+  '--suitable-for-sme': 'suitable_for_sme',
+  '--suitable-for-vcse': 'suitable_for_vcse',
+  '--has-options': 'has_options',
+};
+
+function parseArgs(argv) {
+  const out = {
+    queries: [],
+    filters: {},
+    limit: 20,
+    include_facets: false,
+    include_history: false,
+    include_raw_ocds: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (ARRAY_FILTERS[arg]) {
+      const key = ARRAY_FILTERS[arg];
+      const v = argv[++i];
+      if (v === undefined) die(`${arg} requires a value`);
+      out.filters[key] = (out.filters[key] || []).concat([v]);
+    } else if (STRING_FILTERS[arg]) {
+      const v = argv[++i];
+      if (v === undefined) die(`${arg} requires a value`);
+      out.filters[STRING_FILTERS[arg]] = v;
+    } else if (NUMERIC_FILTERS[arg]) {
+      const v = argv[++i];
+      if (v === undefined) die(`${arg} requires a value`);
+      const n = Number(v);
+      if (!Number.isFinite(n)) die(`${arg} must be a number, got: ${v}`);
+      out.filters[NUMERIC_FILTERS[arg]] = n;
+    } else if (BOOLEAN_FILTERS[arg]) {
+      out.filters[BOOLEAN_FILTERS[arg]] = true;
+    } else if (arg.startsWith('--no-') && BOOLEAN_FILTERS['--' + arg.slice(5)]) {
+      out.filters[BOOLEAN_FILTERS['--' + arg.slice(5)]] = false;
+    } else if (arg === '--limit') {
+      const v = argv[++i];
+      const n = parseInt(v, 10);
+      if (!Number.isFinite(n) || n < 1 || n > 50) die(`--limit must be 1..50, got: ${v}`);
+      out.limit = n;
+    } else if (arg === '--include-facets') {
+      out.include_facets = true;
+    } else if (arg === '--include-history') {
+      out.include_history = true;
+    } else if (arg === '--include-raw-ocds') {
+      out.include_raw_ocds = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      process.exit(0);
+    } else if (arg.startsWith('--')) {
+      die(`Unknown flag: ${arg}`);
+    } else {
+      out.queries.push(arg);
+    }
+  }
+
+  return out;
+}
+
+function printHelp() {
+  process.stdout.write(`Usage:
+  tender-search search <query> [<query>...] [filters]
+  tender-search get --ocid <ocid> [--include-history] [--include-raw-ocds]
+  tender-search get --notice-id <id> [--include-raw-ocds]
+
+Searches a host-side Typesense \`tenders\` collection.
+See container/skills/tender-search/SKILL.md for the full filter list.
+`);
+}
+
+async function search(opts) {
+  if (opts.queries.length === 0) die('search: at least one query is required');
+  if (opts.queries.length > 5) die('search: at most 5 queries allowed');
+
+  const filterBy = buildFilterBy(opts.filters);
+
+  const baseSearch = {
+    collection: COLLECTION,
+    query_by: 'combined_text,supplier_names,enriched_keywords',
+    query_by_weights: '3,2,1',
+    per_page: opts.limit,
+    sort_by: '_text_match:desc,published_date:desc',
+    exclude_fields: 'raw_ocds,lot_descriptions,tender_documents',
+  };
+  if (filterBy) baseSearch.filter_by = filterBy;
+  if (opts.include_facets) baseSearch.facet_by = FACET_FIELDS.join(',');
+  if (!opts.include_history) {
+    baseSearch.group_by = 'ocid';
+    baseSearch.group_limit = 1;
+    baseSearch.group_missing_values = false;
+  }
+
+  const searches = opts.queries.map((q) => ({ ...baseSearch, q }));
+  const response = await tsFetch('/multi_search?union=true', {
+    method: 'POST',
+    body: JSON.stringify({ searches }),
+  });
+
+  const merged = response.results && response.results[0];
+  const rawHits = merged && merged.grouped_hits
+    ? merged.grouped_hits.flatMap((g) => g.hits)
+    : ((merged && merged.hits) || []);
+
+  const ordered = [];
+  if (opts.include_history) {
+    for (const hit of rawHits) {
+      const doc = hit.document;
+      if (!doc || !doc.ocid) continue;
+      ordered.push({ ...doc, _score: hit.text_match || 0 });
+    }
+  } else {
+    // Defensive in-code dedup: even with group_by, different queries can return
+    // different releases of the same procurement. Keep the latest release as the
+    // displayed doc; track max text_match across releases so a strong hit on any
+    // release lifts the procurement's rank.
+    const seen = new Map();
+    for (const hit of rawHits) {
+      const doc = hit.document;
+      const ocid = doc && doc.ocid;
+      if (!ocid) continue;
+      const score = hit.text_match || 0;
+      const date = typeof doc.published_date === 'number' ? doc.published_date : 0;
+      const existing = seen.get(ocid);
+      if (!existing) {
+        seen.set(ocid, { ...doc, _score: score });
+      } else {
+        const existingDate = typeof existing.published_date === 'number' ? existing.published_date : 0;
+        const bestScore = Math.max(existing._score, score);
+        if (date > existingDate) {
+          seen.set(ocid, { ...doc, _score: bestScore });
+        } else {
+          existing._score = bestScore;
+        }
+      }
+    }
+    ordered.push(...seen.values());
+  }
+
+  const results = ordered
+    .sort((a, b) => b._score - a._score)
+    .slice(0, opts.limit)
+    .map(({ _score, ...doc }) => formatResult(doc));
+
+  const payload = {
+    total_found: (merged && merged.found) || results.length,
+    returned: results.length,
+    results,
+  };
+  if (opts.include_facets && merged && merged.facet_counts) {
+    payload.facets = merged.facet_counts;
+  }
+
+  process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+}
+
+async function get(opts) {
+  const ocid = opts.filters.ocid;
+  const noticeId = opts.filters.notice_id;
+  if (!ocid && !noticeId) die('get: provide --ocid or --notice-id');
+
+  const filterBy = noticeId
+    ? `notice_id:=${escapeValue(noticeId)}`
+    : `ocid:=${escapeValue(ocid)}`;
+  const perPage = opts.include_history && ocid ? 250 : 1;
+
+  const params = new URLSearchParams({
+    q: '*',
+    query_by: 'title',
+    filter_by: filterBy,
+    sort_by: 'published_date:desc',
+    per_page: String(perPage),
+  });
+
+  const response = await tsFetch(
+    `/collections/${encodeURIComponent(COLLECTION)}/documents/search?${params}`,
+  );
+
+  const docs = (response.hits || []).map((h) => h.document);
+  if (docs.length === 0) {
+    const target = noticeId ? `notice_id "${noticeId}"` : `ocid "${ocid}"`;
+    die(`Tender ${target} not found`);
+  }
+
+  if (opts.include_history && ocid) {
+    const releases = docs.map((d) => formatGetDoc(d, opts.include_raw_ocds));
+    const payload = { ocid, release_count: releases.length, releases };
+    process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+    return;
+  }
+
+  process.stdout.write(JSON.stringify(formatGetDoc(docs[0], opts.include_raw_ocds), null, 2) + '\n');
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length === 0) {
+    printHelp();
+    process.exit(1);
+  }
+  if (args[0] === '--help' || args[0] === '-h') {
+    printHelp();
+    process.exit(0);
+  }
+
+  const sub = args[0];
+  const opts = parseArgs(args.slice(1));
+
+  if (sub === 'search') {
+    await search(opts);
+  } else if (sub === 'get') {
+    await get(opts);
+  } else {
+    die(`Unknown subcommand: "${sub}". Use "search" or "get".`);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`tender-search: ${err.message}\n`);
+  process.exit(1);
+});
