@@ -1,0 +1,1241 @@
+#!/usr/bin/env node
+// finance: personal-finance ledger CLI for NanoClaw.
+// Ingests bank CSVs (Discovery, Investec), deduplicates via SHA-256 tx_id,
+// classifies via categories.md + per-group merchants.local.json, pairs
+// transfers and refunds, and answers structured queries. Per-group state
+// lives at /workspace/group/finance/. No npm deps — Node 22 builtins only.
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// ---- Paths ---------------------------------------------------------------
+
+function dataDir() {
+  if (process.env.FINANCE_DATA_DIR) return process.env.FINANCE_DATA_DIR;
+  if (fs.existsSync('/workspace/group')) return '/workspace/group/finance';
+  return path.join(process.cwd(), 'finance-data');
+}
+
+const DATA_DIR = dataDir();
+const LEDGER_PATH = path.join(DATA_DIR, 'ledger.csv');
+const BUDGET_PATH = path.join(DATA_DIR, 'budget.csv');
+const MERCHANTS_LOCAL_PATH = path.join(DATA_DIR, 'merchants.local.json');
+const RAW_DIR = path.join(DATA_DIR, 'raw');
+
+function categoriesPath() {
+  const candidates = [
+    process.env.FINANCE_CATEGORIES_PATH,
+    '/usr/local/share/finance/categories.md',
+    path.join(__dirname, 'categories.md'),
+    path.join(DATA_DIR, 'categories.md'),
+  ].filter(Boolean);
+  for (const p of candidates) if (fs.existsSync(p)) return p;
+  die('categories.md not found in any of the standard locations');
+}
+
+const LEDGER_HEADERS = [
+  'tx_id', 'date', 'description_raw', 'description_clean', 'amount',
+  'currency', 'tx_type', 'category', 'subcategory', 'bank', 'account',
+  'transfer_pair_id', 'refund_pair_id', 'confidence', 'flagged_for_review',
+  'notes',
+];
+
+const BUDGET_HEADERS = [
+  'category', 'subcategory', 'frequency', 'amount', 'recurring_type', 'notes',
+];
+
+// ---- Helpers -------------------------------------------------------------
+
+function die(msg, code = 1) {
+  process.stderr.write(`finance: ${msg}\n`);
+  process.exit(code);
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+// ---- CSV I/O -------------------------------------------------------------
+
+function parseCSV(text) {
+  const rows = [];
+  let cur = [''];
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { cur[cur.length - 1] += '"'; i++; continue; }
+        inQuotes = false; continue;
+      }
+      cur[cur.length - 1] += ch; continue;
+    }
+    if (ch === '"') { inQuotes = true; continue; }
+    if (ch === ',') { cur.push(''); continue; }
+    if (ch === '\r') continue;
+    if (ch === '\n') { rows.push(cur); cur = ['']; continue; }
+    cur[cur.length - 1] += ch;
+  }
+  if (cur.length > 1 || cur[0] !== '') rows.push(cur);
+  return rows;
+}
+
+function csvEscape(v) {
+  const s = v == null ? '' : String(v);
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function formatCSVRow(values) {
+  return values.map(csvEscape).join(',') + '\r\n';
+}
+
+function readLedger() {
+  if (!fs.existsSync(LEDGER_PATH)) return { rows: [] };
+  const text = fs.readFileSync(LEDGER_PATH, 'utf8');
+  if (!text.trim()) return { rows: [] };
+  const parsed = parseCSV(text);
+  if (parsed.length === 0) return { rows: [] };
+  const headers = parsed[0];
+  const rows = parsed.slice(1)
+    .filter(r => r.some(c => c && c.trim()))
+    .map(row => {
+      const obj = {};
+      headers.forEach((h, idx) => { obj[h] = row[idx] ?? ''; });
+      return obj;
+    });
+  return { rows };
+}
+
+function writeLedger(rows) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  let out = formatCSVRow(LEDGER_HEADERS);
+  for (const r of rows) {
+    out += formatCSVRow(LEDGER_HEADERS.map(h => r[h] ?? ''));
+  }
+  fs.writeFileSync(LEDGER_PATH, out, 'utf8');
+}
+
+function readBudget() {
+  if (!fs.existsSync(BUDGET_PATH)) return [];
+  const text = fs.readFileSync(BUDGET_PATH, 'utf8');
+  if (!text.trim()) return [];
+  const parsed = parseCSV(text);
+  if (parsed.length < 2) return [];
+  const headers = parsed[0];
+  return parsed.slice(1)
+    .filter(r => r.some(c => c && c.trim()))
+    .map(row => {
+      const obj = {};
+      headers.forEach((h, idx) => { obj[h] = row[idx] ?? ''; });
+      return obj;
+    });
+}
+
+// ---- Raw archive ---------------------------------------------------------
+// One file per ingest, verbatim copy of what the user gave us, named
+// <bank>_<iso-utc>.csv. No tx_id link to the ledger — if you need to audit a
+// ledger row, look at the raw file from around that date.
+
+function isoStamp(d = new Date()) {
+  return d.toISOString().replace(/\.\d+Z$/, 'Z').replace(/:/g, '-');
+}
+
+function bankSlug(bank) {
+  return String(bank || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function bankFromRawFilename(filename) {
+  const base = path.basename(filename, '.csv');
+  const idx = base.indexOf('_');
+  const slug = idx === -1 ? base : base.slice(0, idx);
+  // Re-capitalise the slug back to title case so tx_ids match what
+  // parseBankCSV produces from the same CSV at ingest time.
+  return slug.charAt(0).toUpperCase() + slug.slice(1).toLowerCase();
+}
+
+function listRawFiles() {
+  if (!fs.existsSync(RAW_DIR)) return [];
+  return fs.readdirSync(RAW_DIR)
+    .filter(f => f.endsWith('.csv'))
+    .sort()
+    .map(f => path.join(RAW_DIR, f));
+}
+
+function rawDestPath(bank, when = new Date()) {
+  const base = `${bankSlug(bank)}_${isoStamp(when)}`;
+  let dest = path.join(RAW_DIR, `${base}.csv`);
+  for (let i = 2; fs.existsSync(dest); i++) {
+    dest = path.join(RAW_DIR, `${base}-${i}.csv`);
+  }
+  return dest;
+}
+
+// ---- Hash ----------------------------------------------------------------
+
+// `seq` disambiguates legitimate duplicates within a single (date, descRaw,
+// amount, bank) tuple — e.g. two R20 charges at the same merchant on the
+// same day. seq=0 omits the suffix so historical tx_ids remain stable.
+function txId(date, descRaw, amount, bank, seq = 0) {
+  const s = seq === 0
+    ? `${date}|${descRaw}|${amount}|${bank}`
+    : `${date}|${descRaw}|${amount}|${bank}|${seq}`;
+  return crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
+}
+
+// ---- Categories & learned overrides --------------------------------------
+
+let _categoriesCache = null;
+function loadCategories() {
+  if (_categoriesCache) return _categoriesCache;
+  const text = fs.readFileSync(categoriesPath(), 'utf8');
+  const out = [];
+  let currentCategory = null;
+  for (const line of text.split(/\r?\n/)) {
+    const h2 = line.match(/^##\s+(.+?)\s*$/);
+    if (h2) { currentCategory = h2[1].trim(); continue; }
+    if (!currentCategory) continue;
+    const m = line.match(/^-\s+\*\*(.+?)\*\*:\s*(.+?)\s*$/);
+    if (!m) continue;
+    const subcategory = m[1].trim();
+    const patterns = m[2].split(',').map(p => p.trim()).filter(Boolean);
+    out.push({ category: currentCategory, subcategory, patterns });
+  }
+  _categoriesCache = out;
+  return out;
+}
+
+function loadLearned() {
+  if (!fs.existsSync(MERCHANTS_LOCAL_PATH)) return [];
+  try {
+    const arr = JSON.parse(fs.readFileSync(MERCHANTS_LOCAL_PATH, 'utf8'));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+function appendLearned(entry) {
+  const arr = loadLearned();
+  arr.push(entry);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(MERCHANTS_LOCAL_PATH, JSON.stringify(arr, null, 2), 'utf8');
+}
+
+// ---- Classification ------------------------------------------------------
+
+function cleanDescription(raw) {
+  let s = (raw || '').toUpperCase();
+  s = s.replace(/^(POS PURCHASE|CARD PURCHASE|PURCHASE AT|FEE\s*[-:])\s*/i, '');
+  // Strip trailing card/ref number runs (4+ digits) and everything after
+  s = s.replace(/\s+\d{4,}.*$/, '');
+  // Replace runs of *, /, - between word chars with a single space
+  s = s.replace(/\*+/g, ' ').replace(/\s+/g, ' ').trim();
+  return s;
+}
+
+function normaliseForMatch(s) {
+  // Strip noise punctuation that breaks substring matching (UBER* TRIP → UBER TRIP).
+  return (s || '').toUpperCase().replace(/[*\/\-_]+/g, ' ').replace(/\s+/g, ' ');
+}
+
+function classify(descRaw) {
+  const upper = normaliseForMatch(descRaw);
+
+  // Per-group learned overrides first
+  for (const entry of loadLearned()) {
+    if (entry.pattern && upper.includes(normaliseForMatch(entry.pattern))) {
+      return {
+        category: entry.category,
+        subcategory: entry.subcategory || '',
+        confidence: 'high',
+        candidates: [{ category: entry.category, subcategory: entry.subcategory || '', source: 'learned' }],
+      };
+    }
+  }
+
+  // Global categories.md
+  const matches = [];
+  for (const c of loadCategories()) {
+    if (c.category === 'Inter-account Transfer') continue;
+    for (const p of c.patterns) {
+      if (upper.includes(normaliseForMatch(p))) {
+        matches.push({ category: c.category, subcategory: c.subcategory, pattern: p });
+        break;
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return { category: '', subcategory: '', confidence: 'low', candidates: [] };
+  }
+  const distinctCats = [...new Set(matches.map(m => m.category))];
+  return {
+    category: matches[0].category,
+    subcategory: matches[0].subcategory,
+    confidence: distinctCats.length === 1 ? 'high' : 'medium',
+    candidates: matches.slice(0, 3),
+  };
+}
+
+// ---- Bank CSV parsing ----------------------------------------------------
+
+function detectBank(headers, fullText) {
+  const h = headers.map(s => (s || '').toLowerCase().trim()).join('|');
+  const t = fullText.slice(0, 2000).toLowerCase();
+  if (t.includes('discovery bank') || h.includes('money in') && h.includes('money out')) return 'Discovery';
+  if (t.includes('investec')) return 'Investec';
+  return null;
+}
+
+function findCol(headers, candidates) {
+  const lower = headers.map(h => (h || '').toLowerCase().trim());
+  for (const cand of candidates) {
+    const idx = lower.indexOf(cand);
+    if (idx !== -1) return idx;
+  }
+  for (const cand of candidates) {
+    const idx = lower.findIndex(h => h.includes(cand));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function normaliseDate(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  let m = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  m = s.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  const months = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
+  m = s.toUpperCase().match(/^(\d{1,2})\s+([A-Z]{3})[A-Z]*\s+(\d{4})/);
+  if (m && months[m[2]]) return `${m[3]}-${months[m[2]]}-${m[1].padStart(2, '0')}`;
+  return s;
+}
+
+function parseAmount(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+  let neg = false;
+  s = s.replace(/[Rr]/g, '').replace(/\s/g, '').replace(/,/g, '');
+  if (s.startsWith('(') && s.endsWith(')')) { neg = true; s = s.slice(1, -1); }
+  if (s.startsWith('-')) { neg = true; s = s.slice(1); }
+  if (s.startsWith('+')) s = s.slice(1);
+  const n = parseFloat(s);
+  if (Number.isNaN(n)) return null;
+  return neg ? -n : n;
+}
+
+function parseBankCSV(text, bankHint) {
+  const parsed = parseCSV(text);
+  // Locate header row (banks sometimes prefix CSV with statement metadata)
+  let headerIdx = parsed.findIndex(row =>
+    row.some(c => /date/i.test(c)) &&
+    row.some(c => /(amount|money|debit|credit|deposit|withdrawal)/i.test(c))
+  );
+  if (headerIdx === -1) throw new Error('Could not find header row in CSV (expected columns matching date/amount).');
+
+  const headers = parsed[headerIdx];
+  const dataRows = parsed.slice(headerIdx + 1).filter(r => r.some(c => c && c.trim()));
+
+  const bank = bankHint || detectBank(headers, text) || 'Unknown';
+  const dateCol = findCol(headers, ['posting date', 'transaction date', 'date', 'txn date', 'value date']);
+  const descCol = findCol(headers, ['description', 'narrative', 'details', 'transaction description', 'transaction']);
+  const amountCol = findCol(headers, ['amount', 'transaction amount', 'value']);
+  const moneyInCol = findCol(headers, ['money in', 'credit amount', 'credit', 'deposit']);
+  const moneyOutCol = findCol(headers, ['money out', 'debit amount', 'debit', 'withdrawal']);
+  const accountCol = findCol(headers, ['account', 'account name', 'account type', 'account number']);
+
+  if (dateCol === -1 || descCol === -1) {
+    throw new Error(`Could not locate required columns. Found headers: ${JSON.stringify(headers)}`);
+  }
+
+  const out = [];
+  for (const row of dataRows) {
+    const date = normaliseDate(row[dateCol]);
+    const descRaw = (row[descCol] || '').trim();
+    if (!date || !descRaw) continue;
+
+    let amount = null;
+    if (amountCol !== -1) {
+      amount = parseAmount(row[amountCol]);
+    }
+    if ((amount == null || amount === 0) && (moneyInCol !== -1 || moneyOutCol !== -1)) {
+      const mIn = moneyInCol !== -1 ? parseAmount(row[moneyInCol]) : null;
+      const mOut = moneyOutCol !== -1 ? parseAmount(row[moneyOutCol]) : null;
+      if (mIn && mIn !== 0) amount = Math.abs(mIn);
+      else if (mOut && mOut !== 0) amount = -Math.abs(mOut);
+    }
+    if (amount == null || amount === 0) continue;
+
+    const account = accountCol !== -1 ? (row[accountCol] || '').trim() : '';
+    out.push({ date, descRaw, amount, account, bank });
+  }
+  return out;
+}
+
+// ---- tx_type inference ---------------------------------------------------
+
+const TRANSFER_REGEX = /\b(TRANSFER|TRF|EFT|INTERNET TRF|PAYMENT (TO|FROM|RECEIVED)|RECEIVED PAYMENT|IBT)\b/i;
+const SALARY_REGEX = /\b(SALARY|PAYROLL|WAGES|SAL\s*CR)\b/i;
+const INTEREST_REGEX = /\b(INTEREST CREDIT|ACCRUED INT|CR INTEREST)\b/i;
+const FEE_REGEX = /\b(FEE|CHARGE|OVERDRAFT)\b/i;
+const REFUND_KEYWORDS = /\b(REFUND|REVERSAL|CREDIT NOTE|REIMBURSEMENT)\b/i;
+
+function inferTxType(descRaw, amount, classification) {
+  if (TRANSFER_REGEX.test(descRaw)) return 'transfer';
+  if (amount > 0) {
+    if (REFUND_KEYWORDS.test(descRaw)) return 'refund';
+    return 'income'; // refund-pairing pass may downgrade later
+  }
+  if (FEE_REGEX.test(descRaw) && classification.category === 'Banking Fees') return 'fee';
+  return 'expense';
+}
+
+// ---- Pairing -------------------------------------------------------------
+
+function dateDiffDays(a, b) {
+  const da = Date.parse(a + 'T00:00:00Z');
+  const db = Date.parse(b + 'T00:00:00Z');
+  return Math.abs((da - db) / 86400000);
+}
+
+function nextPairId(combined, prefix) {
+  const re = new RegExp(`^${prefix}_(\\d+)$`);
+  let max = 0;
+  for (const r of combined) {
+    const id = r.transfer_pair_id || r.refund_pair_id || '';
+    const m = id.match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return n => `${prefix}_${String(max + n).padStart(3, '0')}`;
+}
+
+function pairTransfers(newRows, combined) {
+  const idGen = nextPairId(combined, 'trf');
+  let counter = 1;
+  const usedIds = new Set(combined.filter(r => r.transfer_pair_id).map(r => r.tx_id));
+  for (const a of newRows) {
+    if (usedIds.has(a.tx_id)) continue;
+    if (a.tx_type !== 'transfer') continue;
+    if (parseFloat(a.amount) >= 0) continue;
+    let match = null;
+    for (const b of combined) {
+      if (b.tx_id === a.tx_id) continue;
+      if (usedIds.has(b.tx_id)) continue;
+      if (parseFloat(b.amount) <= 0) continue;
+      if (b.tx_type === 'transfer' && b.transfer_pair_id) continue;
+      if (Math.abs(Math.abs(parseFloat(a.amount)) - parseFloat(b.amount)) > 20) continue;
+      if (dateDiffDays(a.date, b.date) > 2) continue;
+      match = b; break;
+    }
+    if (!match) continue;
+    const pid = idGen(counter++);
+    a.transfer_pair_id = pid;
+    match.transfer_pair_id = pid;
+    a.tx_type = 'transfer';
+    match.tx_type = 'transfer';
+    a.category = 'Inter-account Transfer';
+    match.category = 'Inter-account Transfer';
+    a.subcategory = '';
+    match.subcategory = '';
+    a.confidence = 'high';
+    match.confidence = 'high';
+    a.flagged_for_review = 'false';
+    match.flagged_for_review = 'false';
+    usedIds.add(a.tx_id);
+    usedIds.add(match.tx_id);
+  }
+}
+
+function pairRefunds(newRows, combined) {
+  const idGen = nextPairId(combined, 'ref');
+  let counter = 1;
+  const usedRefundIds = new Set(combined.filter(r => r.refund_pair_id).map(r => r.tx_id));
+  for (const a of newRows) {
+    if (usedRefundIds.has(a.tx_id)) continue;
+    const amt = parseFloat(a.amount);
+    if (amt <= 0) continue;
+    if (a.tx_type === 'transfer') continue;
+    const cleanA = a.description_clean;
+
+    let best = null;
+    let bestScore = -1;
+    for (const b of combined) {
+      if (b.tx_id === a.tx_id) continue;
+      const amtB = parseFloat(b.amount);
+      if (amtB >= 0) continue;
+      if (b.tx_type === 'transfer') continue;
+      if (b.refund_pair_id) continue;
+      if (Date.parse(b.date) > Date.parse(a.date)) continue;
+      if (dateDiffDays(a.date, b.date) > 183) continue;
+      if (amt > Math.abs(amtB)) continue;
+
+      const descMatch = cleanA && b.description_clean === cleanA;
+      const catMatch = a.category && b.category === a.category &&
+                       a.subcategory && b.subcategory === a.subcategory;
+      if (!descMatch && !catMatch) continue;
+
+      // Higher score wins. Buckets large enough that lower-priority signals
+      // never override higher-priority ones.
+      let score = 0;
+      if (descMatch) score += 100000;
+      if (Math.abs(amt - Math.abs(amtB)) < 0.01) score += 10000;
+      if (b.bank === a.bank) score += 1000;
+      score += Date.parse(b.date) / 86400000; // days, recency tie-breaker
+      if (score > bestScore) { best = b; bestScore = score; }
+    }
+    if (best) {
+      const pid = idGen(counter++);
+      a.tx_type = 'refund';
+      a.refund_pair_id = pid;
+      best.refund_pair_id = pid;
+      a.category = best.category;
+      a.subcategory = best.subcategory;
+      a.confidence = 'high';
+      a.flagged_for_review = 'false';
+      usedRefundIds.add(a.tx_id);
+    } else if (REFUND_KEYWORDS.test(a.description_raw || '')) {
+      a.tx_type = 'refund';
+      if (a.confidence === 'high') a.confidence = 'medium';
+    }
+  }
+}
+
+// ---- Row builder ---------------------------------------------------------
+
+function buildRow(parsed, classification, txType, txIdValue) {
+  return {
+    tx_id: txIdValue,
+    date: parsed.date,
+    description_raw: parsed.descRaw,
+    description_clean: cleanDescription(parsed.descRaw),
+    amount: parsed.amount.toFixed(2),
+    currency: 'ZAR',
+    tx_type: txType,
+    category: classification.category,
+    subcategory: classification.subcategory,
+    bank: parsed.bank,
+    account: parsed.account || '',
+    transfer_pair_id: '',
+    refund_pair_id: '',
+    confidence: classification.confidence,
+    flagged_for_review: classification.confidence === 'low' ? 'true' : 'false',
+    notes: '',
+  };
+}
+
+// ---- Shared raw-parse + pipeline -----------------------------------------
+
+// Parse every file in raw/ via parseBankCSV. Bank hint comes from the
+// filename (re-titled), but parseBankCSV's own auto-detection wins when the
+// CSV content matches a known bank — so tx_ids stay consistent with what
+// ingest produced. Returns { allParsed, perFile, perBank, errors }.
+function parseAllRaw() {
+  const allParsed = [];
+  const perFile = {};
+  const perBank = {};
+  const errors = [];
+  for (const file of listRawFiles()) {
+    const fname = path.basename(file);
+    const hint = bankFromRawFilename(fname);
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); }
+    catch (e) { errors.push({ file: fname, error: e.message }); continue; }
+    let parsed;
+    try { parsed = parseBankCSV(text, hint); }
+    catch (e) { errors.push({ file: fname, error: e.message }); continue; }
+    perFile[fname] = parsed.length;
+    for (const p of parsed) {
+      perBank[p.bank] = (perBank[p.bank] || 0) + 1;
+      allParsed.push(p);
+    }
+  }
+  return { allParsed, perFile, perBank, errors };
+}
+
+// Run the classify → infer → pair pipeline. existingRows is the current
+// ledger (rebuild passes []); parsedRows comes from parseAllRaw. Returns
+// { newRows, combined, transferPairs, refundPairs }.
+function runPipeline(parsedRows, existingRows) {
+  // Sort tuple-deterministically (no tx_id dependency — seq is derived from
+  // iteration order, so tx_id depends on sort, not the other way round).
+  // True duplicates land adjacent, which is what the seq counter needs.
+  const sorted = parsedRows.slice().sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    if (a.descRaw !== b.descRaw) return a.descRaw.localeCompare(b.descRaw);
+    if (a.amount !== b.amount) return a.amount - b.amount;
+    return a.bank.localeCompare(b.bank);
+  });
+
+  const seen = new Set(existingRows.map(r => r.tx_id));
+  const seqByKey = new Map();
+  const newRows = [];
+  for (const p of sorted) {
+    const baseKey = `${p.date}|${p.descRaw}|${p.amount}|${p.bank}`;
+    const seq = seqByKey.get(baseKey) || 0;
+    seqByKey.set(baseKey, seq + 1);
+    const id = txId(p.date, p.descRaw, p.amount, p.bank, seq);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const cls = classify(p.descRaw);
+    const txType = inferTxType(p.descRaw, p.amount, cls);
+    if (txType === 'transfer') {
+      cls.category = 'Inter-account Transfer';
+      cls.subcategory = '';
+      cls.confidence = 'low';
+    }
+    const row = buildRow(p, cls, txType, id);
+    if (txType === 'transfer' && row.confidence !== 'high') row.flagged_for_review = 'true';
+    newRows.push(row);
+  }
+
+  const combined = [...existingRows, ...newRows];
+  pairTransfers(newRows, combined);
+  pairRefunds(newRows, combined);
+
+  for (const r of newRows) {
+    if (r.tx_type === 'transfer') {
+      if (r.transfer_pair_id) { r.confidence = 'high'; r.flagged_for_review = 'false'; }
+      else { r.confidence = 'low'; r.flagged_for_review = 'true'; }
+    }
+  }
+
+  return {
+    newRows,
+    combined,
+    transferPairs: new Set(newRows.filter(r => r.transfer_pair_id).map(r => r.transfer_pair_id)),
+    refundPairs: new Set(newRows.filter(r => r.refund_pair_id).map(r => r.refund_pair_id)),
+  };
+}
+
+function buildReviewQueue(rows) {
+  return rows
+    .filter(r => r.confidence === 'low' || r.confidence === 'medium' || r.flagged_for_review === 'true')
+    .map(r => ({
+      tx_id: r.tx_id,
+      date: r.date,
+      description_raw: r.description_raw,
+      description_clean: r.description_clean,
+      amount: parseFloat(r.amount),
+      bank: r.bank,
+      tx_type: r.tx_type,
+      confidence: r.confidence,
+      suggested_category: r.category || null,
+      suggested_subcategory: r.subcategory || null,
+      reason: r.tx_type === 'transfer' && !r.transfer_pair_id
+        ? 'Transfer keyword but no matching counterparty found'
+        : (r.confidence === 'low' ? 'No matching merchant pattern' : 'Multiple category candidates'),
+    }));
+}
+
+// ---- Subcommand: ingest --------------------------------------------------
+
+function cmdIngest(args) {
+  const csvPath = args._[0];
+  if (!csvPath) die('Usage: finance ingest <csv-path> [--bank Investec|Discovery] [--dry-run]');
+  if (!fs.existsSync(csvPath)) die(`File not found: ${csvPath}`);
+  const text = fs.readFileSync(csvPath, 'utf8');
+
+  // Try parsing for the bank name and transaction count. Save the file
+  // either way — we promised the user we'd archive what they sent.
+  let parsed = [];
+  let parseError = null;
+  try { parsed = parseBankCSV(text, args.bank || null); }
+  catch (e) { parseError = e.message; }
+
+  const bank = args.bank || (parsed[0] && parsed[0].bank) || 'unknown';
+  const dest = rawDestPath(bank);
+
+  if (!args['dry-run']) {
+    fs.mkdirSync(RAW_DIR, { recursive: true });
+    fs.writeFileSync(dest, text, 'utf8');
+  }
+
+  console.log(JSON.stringify({
+    bank,
+    csv_path: csvPath,
+    saved_as: args['dry-run'] ? null : dest,
+    parsed: parsed.length,
+    parse_error: parseError,
+    raw_files_total: listRawFiles().length,
+    dry_run: !!args['dry-run'],
+  }, null, 2));
+}
+
+// ---- Subcommand: process -------------------------------------------------
+
+function cmdProcess(args) {
+  if (listRawFiles().length === 0) {
+    die(`No raw archive found at ${RAW_DIR}. Run 'finance ingest <csv>' first.`);
+  }
+
+  const { allParsed, perFile, perBank, errors } = parseAllRaw();
+  const existing = readLedger();
+  const { newRows, combined, transferPairs, refundPairs } = runPipeline(allParsed, existing.rows);
+
+  if (!args['dry-run']) {
+    writeLedger(combined);
+  }
+
+  console.log(JSON.stringify({
+    files: perFile,
+    banks: perBank,
+    raw_parsed: allParsed.length,
+    added: newRows.length,
+    transfers_paired: transferPairs.size,
+    refunds_paired: refundPairs.size,
+    review_queue: buildReviewQueue(newRows),
+    parse_errors: errors,
+    dry_run: !!args['dry-run'],
+  }, null, 2));
+}
+
+// ---- Periods -------------------------------------------------------------
+
+function parsePeriod(args) {
+  if (args.month) {
+    const m = String(args.month).match(/^(\d{4})-(\d{2})$/);
+    if (!m) die('--month must be YYYY-MM');
+    const y = +m[1], mo = +m[2];
+    const last = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+    return { start: `${m[1]}-${m[2]}-01`, end: `${m[1]}-${m[2]}-${String(last).padStart(2, '0')}`, label: args.month };
+  }
+  if (args.year) {
+    const m = String(args.year).match(/^(\d{4})$/);
+    if (!m) die('--year must be YYYY');
+    return { start: `${m[1]}-01-01`, end: `${m[1]}-12-31`, label: args.year };
+  }
+  if (args.from || args.to) {
+    return { start: args.from || '0001-01-01', end: args.to || '9999-12-31', label: `${args.from || '*'}..${args.to || '*'}` };
+  }
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const mo = String(now.getUTCMonth() + 1).padStart(2, '0');
+  return parsePeriod({ month: `${y}-${mo}` });
+}
+
+function inPeriod(date, p) {
+  return date >= p.start && date <= p.end;
+}
+
+// ---- Subcommand: summary -------------------------------------------------
+
+function cmdSummary(args) {
+  const period = parsePeriod(args);
+  const groupBy = args['group-by'] || 'category';
+  if (!['category', 'subcategory', 'merchant', 'bank'].includes(groupBy)) {
+    die('--group-by must be one of: category, subcategory, merchant, bank');
+  }
+  const includeTransfers = !!args['include-transfers'];
+  const refundsAsIncome = !!args['refunds-as-income'];
+
+  const { rows } = readLedger();
+  const inRange = rows.filter(r => inPeriod(r.date, period));
+  const budget = readBudget();
+
+  let income = 0, expense = 0, fees = 0, transferCount = 0;
+  const groups = new Map();
+  for (const r of inRange) {
+    const amt = parseFloat(r.amount);
+    if (Number.isNaN(amt)) continue;
+    if (r.tx_type === 'transfer') {
+      transferCount++;
+      if (!includeTransfers) continue;
+    }
+    if (r.tx_type === 'income') income += amt;
+    else if (r.tx_type === 'refund') {
+      if (refundsAsIncome) income += amt;
+      else expense += amt; // positive refund pulls negative expense back toward zero
+    } else if (r.tx_type === 'fee') { expense += amt; fees += amt; }
+    else if (r.tx_type === 'expense') expense += amt;
+
+    let key;
+    switch (groupBy) {
+      case 'category': key = r.category || '(uncategorised)'; break;
+      case 'subcategory': key = `${r.category || '(uncat)'} / ${r.subcategory || '(none)'}`; break;
+      case 'merchant': key = r.description_clean || '(unknown)'; break;
+      case 'bank': key = r.bank || '(unknown)'; break;
+    }
+    if (!groups.has(key)) groups.set(key, { key, total: 0, count: 0 });
+    const g = groups.get(key);
+    g.total += amt;
+    g.count++;
+  }
+
+  const sorted = [...groups.values()]
+    .map(g => ({ ...g, total: round2(g.total) }))
+    .sort((a, b) => a.total - b.total);
+
+  for (const g of sorted) {
+    if (groupBy === 'category') {
+      const matching = budget.filter(b => b.category === g.key);
+      if (matching.length > 0) {
+        let monthlyEquivalent = 0;
+        for (const b of matching) {
+          const amt = parseFloat(b.amount) || 0;
+          if (b.frequency === 'monthly') monthlyEquivalent += amt;
+          else if (b.frequency === 'annual') monthlyEquivalent += amt / 12;
+          else if (b.frequency === 'quarterly') monthlyEquivalent += amt / 3;
+        }
+        g.budget = -round2(monthlyEquivalent);
+        g.variance = round2(g.total - g.budget);
+      }
+    }
+  }
+
+  console.log(JSON.stringify({
+    period: period.label,
+    start: period.start,
+    end: period.end,
+    group_by: groupBy,
+    income_total: round2(income),
+    expense_total: round2(expense),
+    fees_total: round2(fees),
+    net: round2(income + expense),
+    groups: sorted,
+    transfers_excluded: includeTransfers ? 0 : transferCount,
+    transactions_counted: inRange.length - (includeTransfers ? 0 : transferCount),
+  }, null, 2));
+}
+
+// ---- Subcommand: search --------------------------------------------------
+
+function cmdSearch(args) {
+  const { rows } = readLedger();
+  const filtered = rows.filter(r => {
+    const amt = parseFloat(r.amount);
+    if (args.category && r.category !== args.category) return false;
+    if (args.subcategory && r.subcategory !== args.subcategory) return false;
+    if (args.merchant && !(r.description_clean || '').toLowerCase().includes(args.merchant.toLowerCase())) return false;
+    if (args.bank && r.bank !== args.bank) return false;
+    if (args.from && r.date < args.from) return false;
+    if (args.to && r.date > args.to) return false;
+    if (args.min !== undefined && amt < parseFloat(args.min)) return false;
+    if (args.max !== undefined && amt > parseFloat(args.max)) return false;
+    if (args.text) {
+      const t = String(args.text).toLowerCase();
+      if (!(r.description_raw || '').toLowerCase().includes(t) &&
+          !(r.description_clean || '').toLowerCase().includes(t)) return false;
+    }
+    if (args.flagged) {
+      if (r.flagged_for_review !== 'true') return false;
+    }
+    return true;
+  });
+  const limit = args.limit ? parseInt(args.limit, 10) : 50;
+  console.log(JSON.stringify({
+    total: filtered.length,
+    returned: Math.min(filtered.length, limit),
+    results: filtered
+      .sort((a, b) => b.date.localeCompare(a.date) || b.tx_id.localeCompare(a.tx_id))
+      .slice(0, limit)
+      .map(r => ({
+        tx_id: r.tx_id,
+        date: r.date,
+        description_raw: r.description_raw,
+        description_clean: r.description_clean,
+        amount: parseFloat(r.amount),
+        currency: r.currency,
+        tx_type: r.tx_type,
+        category: r.category,
+        subcategory: r.subcategory,
+        bank: r.bank,
+        confidence: r.confidence,
+        flagged_for_review: r.flagged_for_review === 'true',
+      })),
+  }, null, 2));
+}
+
+// ---- Subcommand: budget-check --------------------------------------------
+
+function cmdBudgetCheck(args) {
+  const period = parsePeriod(args);
+  const budget = readBudget();
+  const { rows } = readLedger();
+  const inRange = rows.filter(r => inPeriod(r.date, period) && r.tx_type !== 'transfer');
+
+  const missing = [];
+  const amountChanged = [];
+  const discretionaryVariance = [];
+
+  for (const b of budget) {
+    if (b.frequency !== 'monthly') continue;
+    const expected = parseFloat(b.amount) || 0;
+    const matching = inRange.filter(r =>
+      r.category === b.category &&
+      (!b.subcategory || r.subcategory === b.subcategory)
+    );
+
+    if (b.recurring_type === 'debit_order' || b.recurring_type === 'scheduled') {
+      if (matching.length === 0) {
+        missing.push({
+          category: b.category,
+          subcategory: b.subcategory || null,
+          expected,
+          recurring_type: b.recurring_type,
+        });
+        continue;
+      }
+      const largest = matching
+        .slice()
+        .sort((x, y) => Math.abs(parseFloat(y.amount)) - Math.abs(parseFloat(x.amount)))[0];
+      const actual = Math.abs(parseFloat(largest.amount));
+      const deltaPct = expected > 0 ? ((actual - expected) / expected) * 100 : 0;
+      if (Math.abs(deltaPct) > 5) {
+        amountChanged.push({
+          category: b.category,
+          subcategory: b.subcategory || null,
+          expected,
+          actual: round2(actual),
+          delta_pct: round2(deltaPct),
+          tx_id: largest.tx_id,
+          date: largest.date,
+        });
+      }
+    } else if (b.recurring_type === 'discretionary') {
+      const actual = matching
+        .filter(r => r.tx_type !== 'income')
+        .reduce((s, r) => s + parseFloat(r.amount), 0);
+      const variance = actual + expected; // expense is negative; expected is positive budget cap
+      const variancePct = expected > 0 ? (variance / expected) * 100 : 0;
+      discretionaryVariance.push({
+        category: b.category,
+        subcategory: b.subcategory || null,
+        budget: -expected,
+        actual: round2(actual),
+        variance: round2(variance),
+        variance_pct: round2(variancePct),
+      });
+    }
+  }
+
+  // Unexpected recurring debits: rows with debit-order-like keywords whose
+  // category isn't covered by any debit_order/scheduled budget row.
+  const debitOrderKeys = new Set(
+    budget
+      .filter(b => b.recurring_type === 'debit_order' || b.recurring_type === 'scheduled')
+      .map(b => `${b.category}|${b.subcategory || '*'}`)
+  );
+  const unexpectedRecurring = [];
+  const seenClean = new Set();
+  for (const r of inRange) {
+    if (parseFloat(r.amount) >= 0) continue;
+    const key = `${r.category}|${r.subcategory || '*'}`;
+    const keyAny = `${r.category}|*`;
+    if (debitOrderKeys.has(key) || debitOrderKeys.has(keyAny)) continue;
+    if (!/DEBIT ORDER|D\/O|MONTHLY|RECURRING/i.test(r.description_raw)) continue;
+    const dedupKey = r.description_clean || r.description_raw;
+    if (seenClean.has(dedupKey)) continue;
+    seenClean.add(dedupKey);
+    unexpectedRecurring.push({
+      tx_id: r.tx_id,
+      description_clean: r.description_clean,
+      date: r.date,
+      amount: parseFloat(r.amount),
+      category: r.category,
+    });
+  }
+
+  console.log(JSON.stringify({
+    period: period.label,
+    missing_debit_orders: missing,
+    amount_changed: amountChanged,
+    unexpected_recurring: unexpectedRecurring,
+    discretionary_variance: discretionaryVariance,
+  }, null, 2));
+}
+
+// ---- Subcommand: flagged -------------------------------------------------
+
+function cmdFlagged() {
+  const { rows } = readLedger();
+  const flagged = rows.filter(r =>
+    r.flagged_for_review === 'true' || r.confidence === 'low' || r.confidence === 'medium'
+  );
+  console.log(JSON.stringify({
+    total: flagged.length,
+    results: flagged
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .map(r => ({
+        tx_id: r.tx_id,
+        date: r.date,
+        description_raw: r.description_raw,
+        description_clean: r.description_clean,
+        amount: parseFloat(r.amount),
+        bank: r.bank,
+        tx_type: r.tx_type,
+        category: r.category,
+        subcategory: r.subcategory,
+        confidence: r.confidence,
+      })),
+  }, null, 2));
+}
+
+// ---- Subcommand: review --------------------------------------------------
+
+function cmdReview(args) {
+  const txid = args._[0];
+  if (!txid) die('Usage: finance review <tx_id> --category X [--subcategory Y] [--learn]');
+  if (!args.category) die('--category is required');
+  const { rows } = readLedger();
+  const idx = rows.findIndex(r => r.tx_id === txid);
+  if (idx === -1) die(`tx_id not found: ${txid}`);
+  const row = rows[idx];
+  row.category = args.category;
+  row.subcategory = args.subcategory || '';
+  row.confidence = 'high';
+  row.flagged_for_review = 'false';
+  if (row.tx_type === 'transfer' && !row.transfer_pair_id) {
+    row.tx_type = parseFloat(row.amount) >= 0 ? 'income' : 'expense';
+  }
+  writeLedger(rows);
+  if (args.learn) {
+    appendLearned({
+      pattern: row.description_clean,
+      category: args.category,
+      subcategory: args.subcategory || '',
+      added: new Date().toISOString().slice(0, 10),
+    });
+  }
+  console.log(JSON.stringify({
+    updated: row.tx_id,
+    category: row.category,
+    subcategory: row.subcategory,
+    learned: !!args.learn,
+  }, null, 2));
+}
+
+// ---- Subcommand: review-batch --------------------------------------------
+
+function cmdReviewBatch() {
+  let input;
+  try {
+    input = fs.readFileSync(0, 'utf8');
+  } catch (e) {
+    die('review-batch reads JSON from stdin: ' + e.message);
+  }
+  if (!input.trim()) die('review-batch reads JSON from stdin (got empty input)');
+
+  let payload;
+  try { payload = JSON.parse(input); }
+  catch (e) { die('invalid JSON on stdin: ' + e.message); }
+
+  const decisions = Array.isArray(payload.decisions) ? payload.decisions : [];
+  const learnPatterns = Array.isArray(payload.learn_patterns) ? payload.learn_patterns : [];
+  if (decisions.length === 0 && learnPatterns.length === 0) {
+    die('payload must contain at least one of: decisions[], learn_patterns[]');
+  }
+
+  const { rows } = readLedger();
+  const byId = new Map(rows.map(r => [r.tx_id, r]));
+  const notFound = [];
+  let updatedCount = 0;
+
+  for (const d of decisions) {
+    if (!d.tx_id || !d.category) {
+      notFound.push({ tx_id: d.tx_id || null, reason: 'missing tx_id or category' });
+      continue;
+    }
+    const row = byId.get(d.tx_id);
+    if (!row) {
+      notFound.push({ tx_id: d.tx_id, reason: 'tx_id not in ledger' });
+      continue;
+    }
+    row.category = d.category;
+    row.subcategory = d.subcategory || '';
+    row.confidence = 'high';
+    row.flagged_for_review = 'false';
+    if (row.tx_type === 'transfer' && !row.transfer_pair_id) {
+      row.tx_type = parseFloat(row.amount) >= 0 ? 'income' : 'expense';
+    }
+    updatedCount++;
+  }
+
+  // Append learned patterns (dedup by normalised pattern)
+  let learnedCount = 0;
+  if (learnPatterns.length > 0) {
+    const existing = loadLearned();
+    const seen = new Set(existing.map(e => normaliseForMatch(e.pattern || '')));
+    for (const lp of learnPatterns) {
+      if (!lp.pattern || !lp.category) continue;
+      const norm = normaliseForMatch(lp.pattern);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      existing.push({
+        pattern: lp.pattern,
+        category: lp.category,
+        subcategory: lp.subcategory || '',
+        added: new Date().toISOString().slice(0, 10),
+      });
+      learnedCount++;
+    }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(MERCHANTS_LOCAL_PATH, JSON.stringify(existing, null, 2), 'utf8');
+  }
+
+  // Sweep: re-classify any remaining low-confidence rows using the freshly
+  // learned patterns. This catches sibling rows that share a merchant the
+  // agent just resolved.
+  let swept = 0;
+  if (learnedCount > 0) {
+    for (const r of rows) {
+      if (r.confidence !== 'low' && r.flagged_for_review !== 'true') continue;
+      if (r.tx_type === 'transfer') continue; // transfers need pair, not classify
+      const cls = classify(r.description_raw);
+      if (cls.category && cls.confidence !== 'low' &&
+          (cls.category !== r.category || cls.subcategory !== r.subcategory)) {
+        r.category = cls.category;
+        r.subcategory = cls.subcategory;
+        r.confidence = cls.confidence;
+        r.flagged_for_review = cls.confidence === 'low' ? 'true' : 'false';
+        swept++;
+      }
+    }
+  }
+
+  writeLedger(rows);
+
+  console.log(JSON.stringify({
+    updated: updatedCount,
+    not_found: notFound,
+    learned: learnedCount,
+    swept,
+  }, null, 2));
+}
+
+// ---- Subcommand: rebuild -------------------------------------------------
+
+function cmdRebuild(args) {
+  if (listRawFiles().length === 0) {
+    die(`No raw archive found at ${RAW_DIR}. Refusing to wipe ledger.csv. Run 'finance ingest' first.`);
+  }
+
+  const { allParsed, perFile, perBank, errors } = parseAllRaw();
+  if (allParsed.length === 0) {
+    die(`Raw archive at ${RAW_DIR} contains no parseable transactions. Refusing to wipe ledger.csv.`);
+  }
+
+  const { newRows, transferPairs, refundPairs } = runPipeline(allParsed, []);
+  const flagged = newRows.filter(r =>
+    r.flagged_for_review === 'true' || r.confidence === 'low' || r.confidence === 'medium'
+  ).length;
+
+  if (!args['dry-run']) {
+    writeLedger(newRows);
+  }
+
+  console.log(JSON.stringify({
+    files: perFile,
+    banks: perBank,
+    raw_parsed: allParsed.length,
+    ledger_rows: newRows.length,
+    transfers_paired: transferPairs.size,
+    refunds_paired: refundPairs.size,
+    flagged,
+    parse_errors: errors,
+    dry_run: !!args['dry-run'],
+  }, null, 2));
+}
+
+// ---- Subcommand: recategorise --------------------------------------------
+
+function cmdRecategorise(args) {
+  if (!args.all && !args['tx-id']) die('Provide --all or --tx-id <id>');
+  const { rows } = readLedger();
+  const target = args.all ? rows : rows.filter(r => r.tx_id === args['tx-id']);
+  let changed = 0;
+  for (const r of target) {
+    if (r.tx_type === 'transfer' && r.transfer_pair_id) continue;
+    const cls = classify(r.description_raw);
+    if (cls.category && (cls.category !== r.category || cls.subcategory !== r.subcategory)) {
+      r.category = cls.category;
+      r.subcategory = cls.subcategory;
+      r.confidence = cls.confidence;
+      r.flagged_for_review = cls.confidence === 'low' ? 'true' : 'false';
+      changed++;
+    }
+  }
+  writeLedger(rows);
+  console.log(JSON.stringify({ scanned: target.length, changed }, null, 2));
+}
+
+// ---- Arg parser ----------------------------------------------------------
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) {
+        args[key] = true;
+      } else {
+        args[key] = next;
+        i++;
+      }
+    } else {
+      args._.push(a);
+    }
+  }
+  return args;
+}
+
+// ---- Entrypoint ----------------------------------------------------------
+
+function help() {
+  process.stdout.write([
+    'finance — personal-finance ledger CLI',
+    '',
+    'Usage:',
+    '  finance ingest <csv-path> [--bank Investec|Discovery] [--dry-run]',
+    '                                        # stash to raw/<bank>.csv only',
+    '  finance process [--dry-run]           # categorise & append pending raw → ledger',
+    '  finance review <tx_id> --category <cat> [--subcategory <sub>] [--learn]',
+    '  finance review-batch                  # reads JSON from stdin',
+    '  finance summary [--month YYYY-MM | --year YYYY | --from D --to D]',
+    '                  [--group-by category|subcategory|merchant|bank]',
+    '                  [--include-transfers] [--refunds-as-income]',
+    '  finance search [--category X] [--subcategory Y] [--merchant M]',
+    '                 [--min N] [--max N] [--from D] [--to D] [--text "kw"]',
+    '                 [--bank X] [--flagged] [--limit N]',
+    '  finance budget-check [--month YYYY-MM]',
+    '  finance flagged',
+    '  finance recategorise [--all | --tx-id <id>]',
+    '  finance rebuild [--dry-run]          # wipe & rebuild ledger from raw/',
+    '',
+    `Data dir: ${DATA_DIR}`,
+    `Raw dir : ${RAW_DIR}`,
+    '',
+  ].join('\n'));
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  const sub = argv[0];
+  const args = parseArgs(argv.slice(1));
+  switch (sub) {
+    case 'ingest':       return cmdIngest(args);
+    case 'process':      return cmdProcess(args);
+    case 'review':       return cmdReview(args);
+    case 'review-batch': return cmdReviewBatch();
+    case 'summary':      return cmdSummary(args);
+    case 'search':       return cmdSearch(args);
+    case 'budget-check': return cmdBudgetCheck(args);
+    case 'flagged':      return cmdFlagged();
+    case 'recategorise': return cmdRecategorise(args);
+    case 'rebuild':      return cmdRebuild(args);
+    case 'help':
+    case '--help':
+    case '-h':
+    case undefined:
+      return help();
+    default:
+      die(`Unknown subcommand: ${sub}. Try 'finance help'.`);
+  }
+}
+
+main();

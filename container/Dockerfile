@@ -66,6 +66,12 @@ RUN chmod +x /usr/local/bin/generate-image
 COPY skills/tender-search/tender-search /usr/local/bin/tender-search
 RUN chmod +x /usr/local/bin/tender-search
 
+# Install finance CLI and SA merchant taxonomy
+COPY skills/finance/finance /usr/local/bin/finance
+RUN chmod +x /usr/local/bin/finance
+RUN mkdir -p /usr/local/share/finance
+COPY skills/finance/categories.md /usr/local/share/finance/categories.md
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
