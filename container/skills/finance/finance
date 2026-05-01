@@ -21,7 +21,9 @@ const DATA_DIR = dataDir();
 const LEDGER_PATH = path.join(DATA_DIR, 'ledger.csv');
 const BUDGET_PATH = path.join(DATA_DIR, 'budget.csv');
 const MERCHANTS_LOCAL_PATH = path.join(DATA_DIR, 'merchants.local.json');
+const STATE_PATH = path.join(DATA_DIR, 'processed_state.json');
 const RAW_DIR = path.join(DATA_DIR, 'raw');
+const STATE_SCHEMA_VERSION = 1;
 
 function categoriesPath() {
   const candidates = [
@@ -163,6 +165,32 @@ function listRawFiles() {
     .map(f => path.join(RAW_DIR, f));
 }
 
+// ---- Processed-file state ------------------------------------------------
+// Tracks which raw files have already been folded into the ledger so
+// `finance process` can skip them on subsequent runs. Keyed by basename
+// (raw filenames already include bank + ISO timestamp, so they're unique).
+
+function readProcessedState() {
+  const empty = { schema_version: STATE_SCHEMA_VERSION, processed_files: {} };
+  if (!fs.existsSync(STATE_PATH)) return empty;
+  try {
+    const obj = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    if (!obj || typeof obj !== 'object') return empty;
+    if (!obj.processed_files || typeof obj.processed_files !== 'object') {
+      obj.processed_files = {};
+    }
+    if (!obj.schema_version) obj.schema_version = STATE_SCHEMA_VERSION;
+    return obj;
+  } catch { return empty; }
+}
+
+function writeProcessedState(state) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = STATE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, STATE_PATH);
+}
+
 function rawDestPath(bank, when = new Date()) {
   const base = `${bankSlug(bank)}_${isoStamp(when)}`;
   let dest = path.join(RAW_DIR, `${base}.csv`);
@@ -174,13 +202,11 @@ function rawDestPath(bank, when = new Date()) {
 
 // ---- Hash ----------------------------------------------------------------
 
-// `seq` disambiguates legitimate duplicates within a single (date, descRaw,
-// amount, bank) tuple — e.g. two R20 charges at the same merchant on the
-// same day. seq=0 omits the suffix so historical tx_ids remain stable.
-function txId(date, descRaw, amount, bank, seq = 0) {
-  const s = seq === 0
-    ? `${date}|${descRaw}|${amount}|${bank}`
-    : `${date}|${descRaw}|${amount}|${bank}|${seq}`;
+// tx_id is a content hash of the transaction's identifying fields. Same
+// transaction observed across overlapping bank exports always produces the
+// same tx_id, which is what ledger-level dedup relies on.
+function txId(date, descRaw, amount, bank) {
+  const s = `${date}|${descRaw}|${amount}|${bank}`;
   return crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
 }
 
@@ -529,17 +555,23 @@ function buildRow(parsed, classification, txType, txIdValue) {
 
 // ---- Shared raw-parse + pipeline -----------------------------------------
 
-// Parse every file in raw/ via parseBankCSV. Bank hint comes from the
-// filename (re-titled), but parseBankCSV's own auto-detection wins when the
-// CSV content matches a known bank — so tx_ids stay consistent with what
-// ingest produced. Returns { allParsed, perFile, perBank, errors }.
-function parseAllRaw() {
+// Parse files in raw/ via parseBankCSV. Bank hint comes from the filename
+// (re-titled), but parseBankCSV's own auto-detection wins when the CSV
+// content matches a known bank — so tx_ids stay consistent with what
+// ingest produced. If `filenames` is provided, only those basenames are
+// parsed; otherwise every file in raw/ is. Each parsed row carries
+// `_source_file` so callers can attribute new ledger rows back to their
+// source CSV (writeLedger ignores fields outside LEDGER_HEADERS).
+// Returns { allParsed, perFile, perBank, errors }.
+function parseAllRaw(filenames) {
+  const filter = filenames ? new Set(filenames) : null;
   const allParsed = [];
   const perFile = {};
   const perBank = {};
   const errors = [];
   for (const file of listRawFiles()) {
     const fname = path.basename(file);
+    if (filter && !filter.has(fname)) continue;
     const hint = bankFromRawFilename(fname);
     let text;
     try { text = fs.readFileSync(file, 'utf8'); }
@@ -549,6 +581,7 @@ function parseAllRaw() {
     catch (e) { errors.push({ file: fname, error: e.message }); continue; }
     perFile[fname] = parsed.length;
     for (const p of parsed) {
+      p._source_file = fname;
       perBank[p.bank] = (perBank[p.bank] || 0) + 1;
       allParsed.push(p);
     }
@@ -560,9 +593,7 @@ function parseAllRaw() {
 // ledger (rebuild passes []); parsedRows comes from parseAllRaw. Returns
 // { newRows, combined, transferPairs, refundPairs }.
 function runPipeline(parsedRows, existingRows) {
-  // Sort tuple-deterministically (no tx_id dependency — seq is derived from
-  // iteration order, so tx_id depends on sort, not the other way round).
-  // True duplicates land adjacent, which is what the seq counter needs.
+  // Sort tuple-deterministically so newRows order is stable across runs.
   const sorted = parsedRows.slice().sort((a, b) => {
     if (a.date !== b.date) return a.date.localeCompare(b.date);
     if (a.descRaw !== b.descRaw) return a.descRaw.localeCompare(b.descRaw);
@@ -571,13 +602,9 @@ function runPipeline(parsedRows, existingRows) {
   });
 
   const seen = new Set(existingRows.map(r => r.tx_id));
-  const seqByKey = new Map();
   const newRows = [];
   for (const p of sorted) {
-    const baseKey = `${p.date}|${p.descRaw}|${p.amount}|${p.bank}`;
-    const seq = seqByKey.get(baseKey) || 0;
-    seqByKey.set(baseKey, seq + 1);
-    const id = txId(p.date, p.descRaw, p.amount, p.bank, seq);
+    const id = txId(p.date, p.descRaw, p.amount, p.bank);
     if (seen.has(id)) continue;
     seen.add(id);
     const cls = classify(p.descRaw);
@@ -589,6 +616,7 @@ function runPipeline(parsedRows, existingRows) {
     }
     const row = buildRow(p, cls, txType, id);
     if (txType === 'transfer' && row.confidence !== 'high') row.flagged_for_review = 'true';
+    if (p._source_file) row._source_file = p._source_file;
     newRows.push(row);
   }
 
@@ -668,19 +696,88 @@ function cmdIngest(args) {
 // ---- Subcommand: process -------------------------------------------------
 
 function cmdProcess(args) {
-  if (listRawFiles().length === 0) {
+  const allRaw = listRawFiles().map(f => path.basename(f));
+  if (allRaw.length === 0) {
     die(`No raw archive found at ${RAW_DIR}. Run 'finance ingest <csv>' first.`);
   }
 
-  const { allParsed, perFile, perBank, errors } = parseAllRaw();
+  const state = readProcessedState();
+  const alreadyProcessed = new Set(Object.keys(state.processed_files));
+
+  // Decide which raw files this run should fold into the ledger.
+  let toProcess;
+  if (args['reprocess-all']) {
+    toProcess = allRaw.slice();
+  } else if (args['reprocess-file']) {
+    const wanted = String(args['reprocess-file']);
+    const match = allRaw.find(f => f === wanted || f === path.basename(wanted));
+    if (!match) {
+      die(`--reprocess-file: '${wanted}' not found in ${RAW_DIR}. Available: ${allRaw.join(', ') || '(none)'}`);
+    }
+    toProcess = [match];
+  } else {
+    toProcess = allRaw.filter(f => !alreadyProcessed.has(f));
+  }
+
+  const skipped = allRaw.filter(f => !toProcess.includes(f));
+
+  // Nothing new to do — short-circuit before touching the pipeline.
+  if (toProcess.length === 0) {
+    console.log(JSON.stringify({
+      processed: [],
+      skipped,
+      files: {},
+      banks: {},
+      raw_parsed: 0,
+      added: 0,
+      transfers_paired: 0,
+      refunds_paired: 0,
+      review_queue: [],
+      parse_errors: [],
+      dry_run: !!args['dry-run'],
+      message: `No new files to process. ${skipped.length} already processed; pass --reprocess-file <name> or --reprocess-all to override.`,
+    }, null, 2));
+    return;
+  }
+
+  const { allParsed, perFile, perBank, errors } = parseAllRaw(toProcess);
   const existing = readLedger();
   const { newRows, combined, transferPairs, refundPairs } = runPipeline(allParsed, existing.rows);
 
+  // Group newRows by source file for per-file rows_added.
+  const addedPerFile = {};
+  for (const r of newRows) {
+    const src = r._source_file;
+    if (!src) continue;
+    addedPerFile[src] = (addedPerFile[src] || 0) + 1;
+  }
+
+  // Files that errored out shouldn't be marked processed — leaving them
+  // unrecorded means the next run retries them (after the user fixes the
+  // file). Successful parse → entry in state.processed_files.
+  const erroredFiles = new Set(errors.map(e => e.file));
+  const successfullyProcessed = toProcess.filter(f => !erroredFiles.has(f));
+
   if (!args['dry-run']) {
     writeLedger(combined);
+
+    const now = new Date().toISOString();
+    for (const fname of successfullyProcessed) {
+      const sample = allParsed.find(p => p._source_file === fname);
+      state.processed_files[fname] = {
+        processed_at: now,
+        rows_parsed: perFile[fname] || 0,
+        rows_added: addedPerFile[fname] || 0,
+        bank: sample ? sample.bank : bankFromRawFilename(fname),
+      };
+    }
+    state.schema_version = STATE_SCHEMA_VERSION;
+    writeProcessedState(state);
   }
 
   console.log(JSON.stringify({
+    processed: successfullyProcessed,
+    skipped,
     files: perFile,
     banks: perBank,
     raw_parsed: allParsed.length,
@@ -1008,6 +1105,51 @@ function cmdReview(args) {
   }, null, 2));
 }
 
+// ---- Subcommand: remove --------------------------------------------------
+
+function cmdRemove(args) {
+  const ids = args._.filter(Boolean);
+  if (ids.length === 0) {
+    die('Usage: finance remove <tx_id> [<tx_id>...] [--dry-run]');
+  }
+  const { rows } = readLedger();
+  const idSet = new Set(ids);
+  const removed = [];
+  const notFound = [];
+  const orphanedPairs = [];
+
+  for (const id of ids) {
+    const row = rows.find(r => r.tx_id === id);
+    if (!row) { notFound.push(id); continue; }
+    removed.push({
+      tx_id: row.tx_id,
+      date: row.date,
+      amount: row.amount,
+      description_raw: row.description_raw,
+      bank: row.bank,
+    });
+    for (const field of ['transfer_pair_id', 'refund_pair_id']) {
+      if (row[field]) {
+        const partner = rows.find(r => !idSet.has(r.tx_id) && r[field] === row[field]);
+        if (partner) {
+          partner[field] = '';
+          orphanedPairs.push({ tx_id: partner.tx_id, broken: field });
+        }
+      }
+    }
+  }
+
+  const remaining = rows.filter(r => !idSet.has(r.tx_id));
+  if (!args['dry-run'] && removed.length > 0) writeLedger(remaining);
+
+  console.log(JSON.stringify({
+    removed,
+    not_found: notFound,
+    orphaned_pairs: orphanedPairs,
+    dry_run: !!args['dry-run'],
+  }, null, 2));
+}
+
 // ---- Subcommand: review-batch --------------------------------------------
 
 function cmdReviewBatch() {
@@ -1123,8 +1265,33 @@ function cmdRebuild(args) {
     r.flagged_for_review === 'true' || r.confidence === 'low' || r.confidence === 'medium'
   ).length;
 
+  const addedPerFile = {};
+  for (const r of newRows) {
+    const src = r._source_file;
+    if (!src) continue;
+    addedPerFile[src] = (addedPerFile[src] || 0) + 1;
+  }
+  const erroredFiles = new Set(errors.map(e => e.file));
+
   if (!args['dry-run']) {
     writeLedger(newRows);
+
+    // Rebuild has just folded every parseable raw file into a fresh
+    // ledger, so mark all of them processed at `now`. Files that errored
+    // are intentionally omitted so the next `finance process` can retry.
+    const now = new Date().toISOString();
+    const fresh = { schema_version: STATE_SCHEMA_VERSION, processed_files: {} };
+    for (const fname of Object.keys(perFile)) {
+      if (erroredFiles.has(fname)) continue;
+      const sample = allParsed.find(p => p._source_file === fname);
+      fresh.processed_files[fname] = {
+        processed_at: now,
+        rows_parsed: perFile[fname] || 0,
+        rows_added: addedPerFile[fname] || 0,
+        bank: sample ? sample.bank : bankFromRawFilename(fname),
+      };
+    }
+    writeProcessedState(fresh);
   }
 
   console.log(JSON.stringify({
@@ -1193,9 +1360,13 @@ function help() {
     'Usage:',
     '  finance ingest <csv-path> [--bank Investec|Discovery] [--dry-run]',
     '                                        # stash to raw/<bank>.csv only',
-    '  finance process [--dry-run]           # categorise & append pending raw → ledger',
+    '  finance process [--dry-run] [--reprocess-file <name>] [--reprocess-all]',
+    '                                        # categorise & append pending raw → ledger',
+    '                                        # default: skip files already in processed_state.json',
     '  finance review <tx_id> --category <cat> [--subcategory <sub>] [--learn]',
     '  finance review-batch                  # reads JSON from stdin',
+    '  finance remove <tx_id> [<tx_id>...] [--dry-run]',
+    '                                        # delete one or more rows from the ledger',
     '  finance summary [--month YYYY-MM | --year YYYY | --from D --to D]',
     '                  [--group-by category|subcategory|merchant|bank]',
     '                  [--include-transfers] [--refunds-as-income]',
@@ -1222,6 +1393,7 @@ function main() {
     case 'process':      return cmdProcess(args);
     case 'review':       return cmdReview(args);
     case 'review-batch': return cmdReviewBatch();
+    case 'remove':       return cmdRemove(args);
     case 'summary':      return cmdSummary(args);
     case 'search':       return cmdSearch(args);
     case 'budget-check': return cmdBudgetCheck(args);

@@ -1,6 +1,6 @@
 ---
 name: finance
-description: Use the `finance` CLI for personal-finance questions and bank-statement ingestion. Trigger this skill whenever the user asks about their spending, income, savings, budget, debit orders, transactions, transfers, fees, or category breakdowns — or drops a bank-statement CSV into chat (Discovery, Investec, or any ZAR bank export). Two-step ingest: `finance ingest <csv>` saves the bank's CSV verbatim to `raw/<bank>_<iso>.csv` (no classification, no questions, just an archive); `finance process` then re-parses every file in `raw/`, dedupes against the ledger, classifies, pairs transfers/refunds, and returns a review queue. Also covers monthly/yearly summaries, budget reconciliation (missing debit orders, amount changes, discretionary variance), flexible search across the ledger, and per-group merchant learning when the user resolves flagged transactions.
+description: Use the `finance` CLI for personal-finance questions and bank-statement ingestion. Trigger this skill whenever the user asks about their spending, income, savings, budget, debit orders, transactions, transfers, fees, category breakdowns, or duplicate transactions — or drops a bank-statement CSV into chat (Discovery, Investec, or any ZAR bank export). Two-step ingest: `finance ingest <csv>` saves the bank's CSV verbatim to `raw/<bank>_<iso>.csv` (no classification, no questions, just an archive); `finance process` then re-parses every file in `raw/`, dedupes against the ledger, classifies, pairs transfers/refunds, and returns a review queue. Also covers monthly/yearly summaries, budget reconciliation (missing debit orders, amount changes, discretionary variance), flexible search across the ledger, agentic fuzzy-duplicate detection (catches re-imported rows where the bank rewrote the description), and per-group merchant learning when the user resolves flagged transactions.
 allowed-tools: Bash(finance:*)
 ---
 
@@ -12,6 +12,7 @@ Per-group state lives in `/workspace/group/finance/`:
 - `ledger.csv` — master merged ledger across all banks (cleaned, classified, paired)
 - `budget.csv` — the user's monthly/annual/quarterly budget targets
 - `merchants.local.json` — learned merchant overrides (auto-appended when user resolves a flagged txn)
+- `processed_state.json` — tracks which raw files have already been folded into the ledger, so `finance process` can skip them on subsequent runs. Auto-maintained by `process` and `rebuild`; never edit by hand.
 - `raw/<bank>_<iso>.csv` — verbatim copy of every bank CSV the user has ever sent, named with the bank prefix and ISO timestamp of the upload (e.g. `discovery_2026-04-28T20-10-33Z.csv`). Files accumulate over time; ordering is preserved by filename. Use these only to spot-check a question or rebuild from scratch — there's no row-level link to the ledger.
 
 Global taxonomy lives at `/usr/local/share/finance/categories.md` (also visible in this skill dir). Edit it to add merchants or fix mismatches; then run `finance recategorise --all`.
@@ -28,6 +29,7 @@ finance budget-check --month 2026-04
 finance search --category Groceries --from 2026-01-01 --to 2026-04-30
 finance review a3f9c1 --category Subscriptions --subcategory "Cloud/Tech" --learn
 finance flagged
+finance remove a3f9c1 b27d04          # only after the user confirms duplicate cleanup
 ```
 
 All output is JSON to stdout. Errors go to stderr with exit 1.
@@ -37,8 +39,10 @@ All output is JSON to stdout. Errors go to stderr with exit 1.
 The flow is **two-step by design**: `ingest` only stashes the raw CSV; `process` is what categorises and appends to the ledger. This lets the user drop several CSVs (Investec on Monday, Discovery on Friday) and triage them in one batch.
 
 - **User drops a CSV file into chat** → extract the `attachments/<file>.csv` path from the `[File: ...]` reference and call `finance ingest`. Pass `--bank` if the filename or context hints at one (otherwise the CLI auto-detects from CSV content). **Do NOT classify, ask review questions, or run `process` unless the user asks** — just confirm with a short ack ("Stashed 84 Investec txns. Say 'process' or send more CSVs first."). The ingest output reports the bank, parsed-row count, and total raw files on disk.
-- **User asks to process / categorise / "go through them" / "let's do it"** → run `finance process`, then triage the `review_queue` agentically (see workflow below). Auto-resolve everything you're confident about via `finance review-batch`, then ask the user only about the genuinely ambiguous remainder.
-- **User asks a "how much / what / when" question about money** → translate to `summary`, `search`, or `budget-check`. If raw files exist that haven't been processed (you can sanity-check by running `finance process --dry-run` and checking `added`), mention it in passing.
+- **User asks to process / categorise / "go through them" / "let's do it"** → run `finance process`, then triage the `review_queue` agentically (see workflow below). `process` only handles raw files that aren't already in `processed_state.json`, so previously-reviewed work isn't disturbed. If everything is up to date the CLI prints a `message` saying so — relay that to the user instead of pretending you triaged anything. Auto-resolve everything you're confident about via `finance review-batch`, then ask the user only about the genuinely ambiguous remainder.
+- **User asks to reprocess a specific file** ("reprocess the discovery one", "redo investec_2026-04-28..."): run `finance process --reprocess-file <name>`. Use this only when the user explicitly asks — never on your own initiative. For "redo everything", `--reprocess-all`. Both are safe (the ledger is dedup'd by `tx_id`) but they re-flag rows whose pattern matches changed since the last run, which can dirty work the user already reviewed.
+- **User asks a "how much / what / when" question about money** → translate to `summary`, `search`, or `budget-check`. If raw files exist that haven't been processed yet (`processed_state.json` is the source of truth — check the `skipped` vs `processed` lists in a `finance process --dry-run`), mention it in passing.
+- **User asks to find/remove/check for duplicates** ("any dupes?", "clean up duplicates", "did I double-import March?") → see "Workflow for duplicate detection" below. The agent does the comparison itself by reading `finance search` output — there is no `finance dedupe` command on purpose. **If the user doesn't specify a date range, ask before doing anything else.** Never call `finance remove` until the user confirms the specific candidates.
 
 ## Workflow for `finance process` — agentic auto-resolve
 
@@ -52,7 +56,9 @@ The user-facing rule: **don't ask unless you're actually uncertain.** They want 
 finance process
 ```
 
-Reads every raw row not yet in the ledger across all banks, classifies, pairs transfers/refunds in a single pass (so cross-bank transfers pair correctly even when the two CSVs were stashed days apart), appends to the ledger, and returns the work-list. Headlines: `pending`, `added`, `transfers_paired`, `refunds_paired`. `review_queue` is what to triage next.
+Reads only the raw files not already in `processed_state.json`, classifies their rows, pairs transfers/refunds in a single pass (so cross-bank transfers pair correctly even when the two CSVs were stashed days apart), appends to the ledger, and returns the work-list. Headlines: `processed` (filenames folded in this run), `skipped` (files already done), `added`, `transfers_paired`, `refunds_paired`. `review_queue` is what to triage next.
+
+If `processed: []` and the CLI returns a `message` saying everything is already processed, **don't** invent a triage step — tell the user there's nothing new and stop. They probably forgot they already processed the file, or want to ingest something first.
 
 ### Step 2 — Triage every review-queue item into one of two buckets
 
@@ -145,7 +151,11 @@ Auto-classified 12 transactions ✓ (Pick n Pay ×4, Yebo Fresh ×1, GymCo, Voda
 
 Use `finance review-batch` again with their answers, or `finance review <tx_id> --learn` for a single fix.
 
-### Step 6 — Wrap up
+### Step 6 — Auto-run a duplicate-detection sweep
+
+Before wrapping up, scan the rows just added for fuzzy duplicates. Use `min(date)` to `max(date)` of the new rows (look at the dates in `review_queue` plus what was added — the dates of the raw files give you the bounds even if `review_queue` is empty). Follow the "Workflow for duplicate detection" section below. **Only flag candidates; never `finance remove` without explicit confirmation.** If nothing looks duplicated, say nothing — don't manufacture noise.
+
+### Step 7 — Wrap up
 
 Run `finance summary --month <current>` and present the result with the templates below.
 
@@ -155,6 +165,79 @@ Run `finance summary --month <current>` and present the result with the template
 - User explicitly says "no, that one was actually X" — apply with `finance review <tx_id> --category X --subcategory Y --learn` and confirm in one line.
 
 For anything more, use `review-batch` — it's cheaper and the auto-sweep is valuable.
+
+## Workflow for duplicate detection
+
+The ledger's `tx_id` (SHA-256 of `date|description_raw|amount|bank`) catches byte-identical re-imports — but banks sometimes rewrite descriptions on later exports (extra spaces, a different reference suffix, "PICK N PAY" → "PICK AND PAY ROSEBANK 4521"). When that happens, the same real-world transaction lands in the ledger twice with different `tx_id`s. The agent's job is to find these by *reading* the ledger and reasoning over the descriptions — there is no `finance dedupe` command, on purpose.
+
+### Step 1 — Lock down the date range
+
+**This is non-negotiable: never sweep without a range.** A full-ledger sweep is slow and noisy.
+
+- **User-initiated** ("find duplicates", "clean up dupes"): if they didn't name a range, ask before doing anything else. Offer concrete options: "Which range — last month, last 3 months, year-to-date, or all-time?"
+- **Auto-trigger after `process`**: use the date span of rows just added (`min`/`max` from `review_queue` and the raw filenames you just folded in).
+
+### Step 2 — Pull the candidate window
+
+```bash
+finance search --from <start> --to <end> --limit 5000
+```
+
+The default `--limit 50` is far too low for a dedup sweep. Use a high limit so nothing is silently truncated. If the range really is huge and 5000 isn't enough, narrow the range and run twice — don't run a sweep on truncated output.
+
+### Step 3 — Group and reason
+
+Group the rows by `(date, amount)`. Singletons are not candidates — discard them. For each group with ≥2 rows, look at `description_raw` and `description_clean`:
+
+- **Same bank, same date, same amount, descriptions look like the same merchant with cosmetic differences** → likely duplicate. Examples:
+  - `PICK N PAY ROSEBANK` vs `PICK AND PAY ROSEBANK 4521`
+  - `WOOLWORTHS HYDE PARK` vs `WOOLWORTHS HYDE PARK 102` (extra trailing reference)
+  - `VODACOM AIRTIME` vs `VODACOM AIRTIME RECHARGE`
+- **Different banks, same date, same amount** → almost certainly a transfer between accounts, not a duplicate. If both rows have an empty `transfer_pair_id`, mention it as a potential unpaired transfer; otherwise skip silently.
+- **Same bank, same date, same amount, descriptions identical** → a real duplicate that slipped past `tx_id` dedup (rare; flag it).
+- **Same date, same amount, descriptions look like genuinely different merchants** that just happened to charge the same amount on the same day → not a duplicate. Skip.
+
+Be conservative. False positives waste the user's time more than false negatives — a missed dupe shows up next sweep.
+
+### Step 4 — Flag candidates to the user (don't act)
+
+Present each candidate group as a numbered entry showing both rows side-by-side, with a recommendation on which to keep. Default recommendation: **keep the older `tx_id`** (the original ingest, before the bank rewrote the description). Be explicit about which `tx_id` you're proposing to remove.
+
+```
+Found 2 likely duplicates in April 2026:
+
+1. R185.50 on 2026-04-15 (Discovery)
+   • PICK N PAY ROSEBANK         tx aaaaaa  ← keep (older)
+   • PICK AND PAY ROSEBANK 4521  tx bbbbbb  ← remove?
+
+2. R99.00 on 2026-04-16 (Investec)
+   • VODACOM AIRTIME            tx ccc111   ← keep
+   • VODACOM AIRTIME RECHARGE   tx ddd222   ← remove?
+
+Confirm and I'll remove them, or tell me which ones to keep.
+```
+
+### Step 5 — Remove only after explicit confirmation
+
+Once the user confirms, batch the removals into a single call:
+
+```bash
+finance remove bbbbbb ddd222
+```
+
+Output:
+```json
+{
+  "removed": [...],
+  "not_found": [],
+  "orphaned_pairs": [{ "tx_id": "...", "broken": "transfer_pair_id" }],
+  "dry_run": false
+}
+```
+
+If `orphaned_pairs` is non-empty, surface it to the user — it means a removed row was paired with a transfer or refund and the partner row's link was cleared. Usually fine, but worth noting: "FYI — tx eeeeee was paired with the transfer I removed, so I cleared its `transfer_pair_id`."
+
+If the user says "leave them as-is", drop it and don't re-flag the same pair in this conversation.
 
 ## Subcommands
 
@@ -179,22 +262,29 @@ Output:
 
 If `parse_error` is non-null the file was still saved, but the agent should warn the user and may want to re-ingest with an explicit `--bank`.
 
-### `process [--dry-run]`
+### `process [--dry-run] [--reprocess-file <name>] [--reprocess-all]`
 
-Re-parses every file in `raw/`, dedupes against the current ledger by `tx_id` (SHA-256 of `date|description|amount|bank`, with an occurrence sequence appended for legitimate duplicates so e.g. two R20 charges at the same merchant on the same day are both kept), classifies new rows via `categories.md` + `merchants.local.json`, pairs transfers (±R20, ±2 days, across all banks) and refunds (within 6 months, ≤ original amount), appends to the ledger. Returns the `review_queue` for the agent to triage. Idempotent — running again with no new raw files is a no-op.
+Folds **only the raw files not already in `processed_state.json`** into the ledger: parses them, dedupes against the existing ledger by `tx_id` (SHA-256 of `date|description|amount|bank`), classifies new rows via `categories.md` + `merchants.local.json`, pairs transfers (±R20, ±2 days, across all banks) and refunds (within 6 months, ≤ original amount), appends to the ledger, and records each successfully-processed filename in `processed_state.json` so the next run skips it. Returns the `review_queue` for the agent to triage.
+
+**Override flags** — use only when the user explicitly asks:
+- `--reprocess-file <name>` — re-fold a single named raw file (basename or full path) regardless of state. Useful if the previous run errored or the user wants a specific file's pattern matches re-evaluated.
+- `--reprocess-all` — re-fold every raw file in `raw/`. Safe against the ledger (tx_id dedup) but slow on large archives, and may re-flag rows the user already triaged. Prefer `recategorise --all` if the goal is just refreshing classifications, or `rebuild` for a true from-scratch ledger.
+
+If there's nothing new to process, the CLI exits 0 with `processed: []`, `skipped: [<all files>]`, and a `message` field — no pipeline work is done, no files are written.
+
+Files that fail to parse are reported in `parse_errors` and **not** marked processed, so the next run retries them.
 
 Output:
 ```json
 {
-  "files": {
-    "discovery_2026-04-28T20-10-33Z.csv": 47,
-    "investec_2026-04-28T20-11-12Z.csv": 42
-  },
-  "banks": { "Discovery": 47, "Investec": 42 },
-  "raw_parsed": 89,
-  "added": 89,
-  "transfers_paired": 3,
-  "refunds_paired": 1,
+  "processed": ["investec_2026-04-28T20-11-12Z.csv"],
+  "skipped":   ["discovery_2026-04-28T20-10-33Z.csv"],
+  "files":     { "investec_2026-04-28T20-11-12Z.csv": 42 },
+  "banks":     { "Investec": 42 },
+  "raw_parsed": 42,
+  "added": 42,
+  "transfers_paired": 1,
+  "refunds_paired": 0,
   "review_queue": [
     { "tx_id": "a3f9c1234567", "date": "2026-04-14", "description_raw": "ONLINE PAYMENT REF 8821",
       "amount": -1250.00, "bank": "Investec", "tx_type": "expense",
@@ -205,6 +295,8 @@ Output:
   "dry_run": false
 }
 ```
+
+Backward compat: groups upgrading from before `processed_state.json` existed will, on their first `process` run, treat every raw file on disk as unprocessed and fold them all in one pass. The ledger's `tx_id` dedup makes this a no-op on rows already there, and the state file is populated as a side effect — subsequent runs skip everything until new files are ingested.
 
 ### `review <tx_id> --category <cat> [--subcategory <sub>] [--learn]`
 
@@ -227,6 +319,25 @@ Stdin payload shape:
 ```
 
 Output: `{ updated, not_found: [...], learned, swept }`. `swept` is the count of previously-flagged rows that auto-classified after the new patterns were added — often higher than `updated` for a fresh first ingest.
+
+### `remove <tx_id> [<tx_id>...] [--dry-run]`
+
+Delete one or more rows from `ledger.csv` by `tx_id`. **Use only after the user has explicitly confirmed which `tx_id`s to drop** (see "Workflow for duplicate detection"). If a removed row was paired with a transfer or refund, the partner's `transfer_pair_id` / `refund_pair_id` is cleared automatically and reported in `orphaned_pairs`. Unknown `tx_id`s are reported in `not_found` rather than failing.
+
+Output:
+```json
+{
+  "removed": [
+    { "tx_id": "bbbbbb222222", "date": "2026-04-15", "amount": "-185.50",
+      "description_raw": "PICK AND PAY ROSEBANK 4521", "bank": "Discovery" }
+  ],
+  "not_found": [],
+  "orphaned_pairs": [{ "tx_id": "eeeeee", "broken": "transfer_pair_id" }],
+  "dry_run": false
+}
+```
+
+`--dry-run` reports what *would* be removed without touching the ledger — useful when surfacing a final "about to remove these N rows, ok?" beat.
 
 ### `summary [--month YYYY-MM | --year YYYY | --from D --to D] [--group-by category|subcategory|merchant|bank] [--include-transfers] [--refunds-as-income]`
 
@@ -269,7 +380,7 @@ Re-runs the classifier across some/all rows after editing `categories.md` or aft
 
 ### `rebuild [--dry-run]`
 
-**Wipes `ledger.csv` and rebuilds it from scratch by re-parsing every file in `raw/`.** Replays the full pipeline: classify → infer tx_type → pair transfers → pair refunds. Use this after a classifier change, refund-pairing fix, or any logic change that affects the entire dataset — not just classifications.
+**Wipes `ledger.csv` and rebuilds it from scratch by re-parsing every file in `raw/`.** Replays the full pipeline: classify → infer tx_type → pair transfers → pair refunds. Also overwrites `processed_state.json` so every successfully-parsed raw file is marked processed at the rebuild timestamp — `finance process` will skip them all on the next run. Use this after a classifier change, refund-pairing fix, or any logic change that affects the entire dataset — not just classifications.
 
 **Caveats:**
 - **Manual review decisions are lost.** Any `finance review` / `review-batch` corrections that overrode classifier output get redone from scratch. Learned patterns in `merchants.local.json` survive (they're applied during classification), so single user corrections that included `--learn` will re-apply correctly. Single corrections without `--learn` won't.
@@ -401,6 +512,8 @@ When the user replies, run `finance review <tx_id> --category X --subcategory Y 
 - **Foreign currency**: show the original currency value first. ZAR equivalent is not auto-calculated yet — flag if the user asks for it.
 - **Categories.md is the global baseline; merchants.local.json is your group's learned overrides.** For genuinely common SA variants the whole user-base would benefit from, edit `categories.md` directly. For per-group quirks, the local overrides are right.
 - **For ambiguous user requests** ("how am I doing?"), default to `finance summary --month <current>` followed by `finance budget-check --month <current>` and combine into one response.
+- **Never run `finance remove` without explicit user confirmation**, even when a duplicate looks unambiguous. The agent's job is to flag, explain, and recommend; the user decides which row dies. This applies to the post-`process` auto-sweep too — flag candidates, don't act on them.
+- **Never sweep for duplicates without a date range.** If the user asks to "find duplicates" without one, ask for a range first. The auto-sweep after `process` uses the date span of the rows just added, not the whole ledger.
 
 ## Tips
 
